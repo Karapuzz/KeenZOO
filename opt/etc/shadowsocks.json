@@ -1,0 +1,14 @@
+{
+  "server": [
+    "135.106.194.88"
+  ],
+  "mode": "tcp_and_udp",
+  "server_port": 140,
+  "password": "iibqDfY-xDEyF0J8ntYH28gLob2ycGgy",
+  "timeout": 86400,
+  "method": "chacha20-ietf-poly1305",
+  "local_address": "::",
+  "local_port": 1082,
+  "fast_open": false,
+  "ipv6_first": true
+}

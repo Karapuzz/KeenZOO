@@ -1,0 +1,24 @@
+{
+  "server": "us023s1.pablo.support:443",
+  "auth": "eb9e23423d8-5a523447a2-a65f-63e83ed56abb",
+  "tls": {
+    "sni": "us03s1.pablo.support",
+    "insecure": false,
+    "alpn": [
+      "h3"
+    ]
+  },
+  "quic": {
+    "initStreamReceiveWindow": 8388608,
+    "maxStreamReceiveWindow": 8388608,
+    "initConnReceiveWindow": 20971520,
+    "maxConnReceiveWindow": 20971520,
+    "congestion": "bbr"
+  },
+  "tcpRedirect": {
+    "listen": "0.0.0.0:10830"
+  },
+  "udpTProxy": {
+    "listen": "0.0.0.0:10830"
+  }
+}
