@@ -1,0 +1,13 @@
+#!/bin/sh
+# Применение списков обхода при старте.
+# Только через unblock_update.sh: прямой вызов unblock_ipset.sh не удаляет
+# устаревшие адреса (нет swap) и не перегенерирует конфиг dnsmasq.
+set -eu
+
+[ "${1:-}" != "start" ] && exit 0
+
+[ -x /opt/bin/unblock_update.sh ] || exit 0
+
+/opt/bin/unblock_update.sh >/dev/null 2>&1 &
+
+exit 0
