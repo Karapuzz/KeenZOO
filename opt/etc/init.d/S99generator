@@ -1,0 +1,480 @@
+#!/bin/sh
+# /opt/etc/init.d/S99generator — веб-панель генератора конфигураций.
+# Оболочка: BusyBox ash.
+
+NAME="generator"
+DESC="generator web panel"
+
+APP="/opt/etc/bot/generator.py"
+WORKDIR="/opt/etc/bot"
+PIDFILE="/opt/var/run/${NAME}.pid"
+LOGFILE="/opt/etc/bot/generator.log"
+
+export PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="/opt/etc/bot${PYTHONPATH:+:$PYTHONPATH}"
+# Не писать .pyc рядом с исходниками: /opt лежит на USB-накопителе, и
+# перезапись кэша при каждом импорте изнашивает флешку без пользы —
+# модули всё равно читаются один раз за старт. Заодно снимает давнюю
+# проблему устаревшего __pycache__, подменявшего правленый bot_config.py.
+export PYTHONDONTWRITEBYTECODE=1
+
+# Интерпретатор ищется, а не задаётся жёстко: после установки из opkg
+# python3 может лежать в /opt/bin, /usr/bin или быть версионированным
+# (python3.11). Жёсткий путь /opt/bin/python3 был основной причиной того,
+# что панель не стартовала сразу после деплоя.
+find_python() {
+    for _p in /opt/bin/python3 /usr/bin/python3 /opt/bin/python3.11 \
+              /opt/bin/python3.12 /opt/bin/python3.13; do
+        [ -x "$_p" ] && { printf '%s\n' "$_p"; return 0; }
+    done
+    _p="$(command -v python3 2>/dev/null || true)"
+    [ -n "$_p" ] && { printf '%s\n' "$_p"; return 0; }
+    return 1
+}
+
+# pkill есть не во всех сборках BusyBox. Фолбэк — разбор /proc, без
+# внешних утилит: так остановка панели работает в любом окружении.
+kill_app() {
+    # The pidfile is written immediately after fork. Use it first: relying
+    # only on pkill/proc cmdline is unsafe on BusyBox, where cmdline reads can
+    # be NUL-sensitive and miss the live Python worker.
+    if pidfile_values && kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" 2>/dev/null || true
+    fi
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -f "$APP" 2>/dev/null || true
+        return 0
+    fi
+    for _d in /proc/[0-9]*; do
+        # Читаем через cat: процесс может завершиться между раскрытием
+        # маски и открытием файла, а сообщение оболочки о неудачном
+        # перенаправлении "< файл" не подавляется через 2>/dev/null
+        # у самой команды и засоряет журнал.
+        if cat "$_d/cmdline" 2>/dev/null | tr '\0' ' ' \
+            | grep -q -- "$APP"; then
+            _p="${_d#/proc/}"
+            [ "$_p" = "$$" ] && continue
+            kill "$_p" 2>/dev/null || true
+        fi
+    done
+}
+
+proc_start_time() {
+    _pst_pid="$1"
+    awk '{print $22}' "/proc/$_pst_pid/stat" 2>/dev/null
+}
+
+proc_matches_app() {
+    _pma_pid="$1"
+    [ -r "/proc/$_pma_pid/cmdline" ] || return 1
+    # Do not split /proc/cmdline with tr: BusyBox builds differ in their
+    # handling of NUL escapes, which caused a live Python process to be
+    # missed and S99generator to kill a healthy panel after its retry timeout.
+    # The absolute application path is unique and grep can match it directly
+    # in the NUL-separated proc file.
+    grep -Fq -- "$APP" "/proc/$_pma_pid/cmdline" 2>/dev/null
+}
+
+pidfile_values() {
+    [ -f "$PIDFILE" ] || return 1
+    PID="$(awk 'NR==1 {print $1}' "$PIDFILE" 2>/dev/null || true)"
+    PID_START="$(awk 'NR==1 {print $2}' "$PIDFILE" 2>/dev/null || true)"
+    case "$PID" in ''|*[!0-9]*) return 1 ;; esac
+    return 0
+}
+
+write_pidfile() {
+    _wpf_pid="$1"
+    _wpf_start="$(proc_start_time "$_wpf_pid" || true)"
+    case "$_wpf_start" in ''|*[!0-9]*) rm -f "$PIDFILE"; return 1 ;; esac
+    printf '%s %s\n' "$_wpf_pid" "$_wpf_start" > "$PIDFILE"
+}
+
+panel_port() {
+    # Keep this parser deliberately small and POSIX/BusyBox-awk based. The
+    # previous sed variant over-escaped the capture group in one expression
+    # and returned an empty port for the real unquoted `web_port = 8080` line;
+    # S99 then treated a valid listener as a failed readiness check.
+    awk '
+        /^[[:space:]]*web_port[[:space:]]*=/ {
+            v=$0
+            sub(/^[^=]*=[^0-9]*/, "", v)
+            if (match(v, /^[0-9][0-9]*/)) {
+                print substr(v, RSTART, RLENGTH)
+                exit
+            }
+        }
+    ' /opt/etc/bot/bot_config.py 2>/dev/null
+}
+
+listener_ready() {
+    _lr_port="$1"
+    case "$_lr_port" in ''|*[!0-9]*) return 1 ;; esac
+    # Prefer the tools shipped by the firmware; do not skip the first data
+    # row because BusyBox netstat/ss builds differ in whether they print a
+    # header. A non-matching header is harmless.
+    if command -v netstat >/dev/null 2>&1 \
+        && netstat -lnt 2>/dev/null \
+        | awk -v p="$_lr_port" '{n=$4; sub(/^.*:/, "", n); if (n == p) ok=1} END {exit !ok}'; then
+        return 0
+    fi
+    if command -v ss >/dev/null 2>&1 \
+        && ss -lnt 2>/dev/null \
+        | awk -v p="$_lr_port" '{n=$4; sub(/^.*:/, "", n); if (n == p) ok=1} END {exit !ok}'; then
+        return 0
+    fi
+    _lr_hex="$(printf '%04X' "$_lr_port")"
+    # Match the hexadecimal local port at the end of the local-address field
+    # and accept either case for the LISTEN state.
+    awk -v p="$_lr_hex" \
+        'toupper($2) ~ (":" p "$") && toupper($4) == "0A" {ok=1}
+         END {exit !ok}' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+process_listener_ready() {
+    _pl_pid="$1"
+    _pl_port="$2"
+    case "$_pl_pid" in ''|*[!0-9]*) return 1 ;; esac
+    case "$_pl_port" in ''|*[!0-9]*) return 1 ;; esac
+    _pl_hex="$(printf '%04X' "$_pl_port" 2>/dev/null)"
+    [ -n "$_pl_hex" ] || return 1
+    # Verify the listening socket belongs to this process. This is a stronger
+    # fallback than trusting an unreliable netstat/ss formatter and still
+    # proves an actual LISTEN socket, not merely a live Python process.
+    for _pl_fd in /proc/$_pl_pid/fd/*; do
+        [ -e "$_pl_fd" ] || continue
+        _pl_link="$(readlink "$_pl_fd" 2>/dev/null || true)"
+        _pl_inode="$(
+            printf '%s\n' "$_pl_link" |
+                sed -n 's/^socket:\[\([0-9][0-9]*\)\]$/\1/p'
+        )"
+        [ -n "$_pl_inode" ] || continue
+        if awk -v p="$_pl_hex" -v i="$_pl_inode" \
+            'toupper($2) ~ (":" p "$") && toupper($4) == "0A" && $10 == i {ok=1}
+             END {exit !ok}' \
+            "/proc/$_pl_pid/net/tcp" \
+            "/proc/$_pl_pid/net/tcp6" \
+            /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+panel_ready() {
+    _pr_port="$(panel_port)"
+    # The init script must not turn a valid TCP listener into a false start
+    # failure because a local HTTP probe is rejected by loopback netfilter,
+    # an unset Basic-auth configuration, or a BusyBox curl variant. The
+    # deployer's separate web_panel_ready/web_panel_dns_status_ready checks
+    # validate HTTP/API transport after all firewall rules are installed.
+    listener_ready "$_pr_port"
+}
+
+is_running() {
+    pidfile_values || return 1
+    kill -0 "$PID" 2>/dev/null || return 1
+    # PID + kernel start time are the reliable identity pair. Do not require
+    # grep on /proc/<pid>/cmdline here: some Keenetic BusyBox builds expose
+    # NUL-separated cmdline differently, which made S99 declare a live Flask
+    # worker dead and kill it after the listener had already been created.
+    if [ -n "$PID_START" ]; then
+        _ir_now="$(proc_start_time "$PID" || true)"
+        [ -n "$_ir_now" ] && [ "$_ir_now" = "$PID_START" ] || return 1
+    fi
+    return 0
+}
+
+find_app_pid() {
+    for _fap_d in /proc/[0-9]*; do
+        _fap_pid="${_fap_d#/proc/}"
+        proc_matches_app "$_fap_pid" || continue
+        printf '%s\n' "$_fap_pid"
+        return 0
+    done
+    return 1
+}
+
+panel_process_ready() {
+    # BusyBox ash versions differ in which PID they return for a background
+    # subshell containing exec. Recover the real Python PID from /proc before
+    # declaring a successful bind a failed start.
+    READINESS_REASON=""
+    if ! is_running; then
+        _ppr_pid="$(find_app_pid || true)"
+        if [ -z "$_ppr_pid" ]; then
+            READINESS_REASON="generator process not found in /proc"
+            return 1
+        fi
+        PID="$_ppr_pid"
+        if ! write_pidfile "$PID"; then
+            READINESS_REASON="cannot record generator pid/start time"
+            return 1
+        fi
+    fi
+    _ppr_port="$(panel_port)"
+    if panel_ready || process_listener_ready "$PID" "$_ppr_port"; then
+        return 0
+    fi
+    READINESS_REASON="TCP listener not detected on $_ppr_port"
+    if [ "${PANEL_PROCESS_FALLBACK:-0}" = "1" ] && is_running         && grep -Fq "listener: 0.0.0.0:$_ppr_port" "$LOGFILE" 2>/dev/null; then
+        # generator.py prints this line only after make_server() succeeds.
+        # Require both the live PID/start-time pair and the post-bind banner;
+        # a bare Python process is never accepted as readiness.
+        READINESS_REASON="socket probe unavailable; live generator has post-bind banner"
+        return 0
+    fi
+    return 1
+}
+
+wait_app_stopped() {
+    _was=0
+    while [ "$_was" -lt 10 ]; do
+        if pidfile_values && kill -0 "$PID" 2>/dev/null; then
+            :
+        elif find_app_pid >/dev/null 2>&1; then
+            :
+        else
+            return 0
+        fi
+        sleep 1
+        _was=$((_was + 1))
+    done
+    # A process stuck in firewall setup must not survive into the next start;
+    # otherwise two Python workers race for 8080 and the readiness result is
+    # nondeterministic.
+    for _wd in $(find_app_pid 2>/dev/null || true); do
+        kill -9 "$_wd" 2>/dev/null || true
+    done
+    if pidfile_values && kill -0 "$PID" 2>/dev/null; then
+        kill -9 "$PID" 2>/dev/null || true
+    fi
+    return 0
+}
+
+start() {
+    if is_running; then
+        pidfile_values
+        echo "$NAME already running (PID $PID, listener $(panel_port))"
+        return 0
+    fi
+
+    PYTHON="$(find_python || true)"
+    if [ -z "$PYTHON" ]; then
+        echo "FAILED: python3 не найден (opkg install python3)"
+        return 1
+    fi
+
+    if [ ! -f "$APP" ]; then
+        echo "FAILED: не найден $APP"
+        return 1
+    fi
+
+    # Зависимости панели: без flask процесс падал сразу, а pidfile оставался.
+    if ! "$PYTHON" -c "import flask" >/dev/null 2>&1; then
+        echo "FAILED: не установлен flask (opkg install python3-flask)"
+        return 1
+    fi
+    if ! "$PYTHON" -c \
+        "import ast; ast.parse(open('$APP', encoding='utf-8').read())" \
+        >/dev/null 2>&1; then
+        echo "FAILED: синтаксическая ошибка в $APP"
+        echo "Проверка: $PYTHON -m py_compile $APP"
+        return 1
+    fi
+    if ! PYTHONPATH="$WORKDIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON" -c "import bot_config" >/dev/null 2>&1; then
+        echo "FAILED: не импортируется bot_config.py"
+        echo "Проверка: cd $WORKDIR && $PYTHON -c 'import bot_config'"
+        return 1
+    fi
+
+    kill_app
+    wait_app_stopped
+    rm -f "$PIDFILE"
+
+    mkdir -p /opt/var/run /opt/etc/bot
+    touch "$LOGFILE"
+
+    printf 'Starting %s... ' "$NAME"
+
+    cd "$WORKDIR" || {
+        echo "FAILED: cannot cd $WORKDIR"
+        return 1
+    }
+
+    # Устаревший __pycache__ от прежней версии ломает импорт модулей.
+    rm -rf /opt/etc/bot/__pycache__ 2>/dev/null || true
+
+    # При старте по загрузке роутера сеть может быть ещё не готова.
+    # Панель слушает 0.0.0.0, но зависимостям (и правилам iptables)
+    # нужен поднятый интерфейс, поэтому даём сети время появиться.
+    _n=0
+    while [ "$_n" -lt 15 ]; do
+        if ip -4 addr show 2>/dev/null | grep -qE 'inet[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/'; then
+            break
+        fi
+        sleep 2
+        _n=$((_n + 1))
+    done
+
+    # nohup в BusyBox прошивки Keenetic отсутствует ("nohup: not found"),
+    # поэтому процесс отвязывается штатными средствами оболочки:
+    # trap '' HUP игнорирует сигнал при выходе init-скрипта, а </dev/null
+    # отвязывает stdin. Так же запускается и телеграм-бот, который
+    # стабильно работает.
+    (
+        trap '' HUP
+        exec "$PYTHON" -u "$APP" >>"$LOGFILE" 2>&1 </dev/null
+    ) &
+    PID="$!"
+    write_pidfile "$PID" || {
+        kill "$PID" 2>/dev/null || true
+        echo "FAILED: cannot record generator start time"
+        return 1
+    }
+
+    # Панель поднимает Flask и правила iptables — проверяем не только PID,
+    # но и реальный TCP listener. PID живой сам по себе не означает, что
+    # Flask успешно импортировал конфигурацию и открыл порт.
+    _i=0
+    PANEL_PROCESS_FALLBACK=0
+    while [ "$_i" -lt 45 ]; do
+        sleep 1
+        _i=$((_i + 1))
+        # generator.py creates its listening socket before entering
+        # serve_forever. On some Keenetic BusyBox builds the /proc/net or
+        # netstat probe is unreliable, so after five seconds a live generator
+        # process with its post-bind banner is an acceptable local proof. The final
+        # deploy checks still verify HTTP and /api/dns-status.
+        [ "$_i" -ge 5 ] && PANEL_PROCESS_FALLBACK=1
+        panel_process_ready && break
+        kill -0 "$PID" 2>/dev/null || break
+    done
+
+    if panel_process_ready || {
+        PANEL_PROCESS_FALLBACK=1
+        panel_process_ready
+    }; then
+        echo "OK (PID $PID, listener/process ready)"
+        return 0
+    fi
+
+    # Процесс не выжил. Одна повторная попытка: при загрузке роутера
+    # частая причина — не готовая сеть или занятый порт после
+    # предыдущего экземпляра.
+    echo "retry..."
+    kill_app
+    wait_app_stopped
+    sleep 2
+    (
+        trap '' HUP
+        exec "$PYTHON" -u "$APP" >>"$LOGFILE" 2>&1 </dev/null
+    ) &
+    PID="$!"
+    write_pidfile "$PID" || {
+        kill "$PID" 2>/dev/null || true
+        echo "FAILED: cannot record generator start time"
+        return 1
+    }
+    _i=0
+    PANEL_PROCESS_FALLBACK=0
+    while [ "$_i" -lt 45 ]; do
+        sleep 1
+        _i=$((_i + 1))
+        [ "$_i" -ge 5 ] && PANEL_PROCESS_FALLBACK=1
+        panel_process_ready && break
+        kill -0 "$PID" 2>/dev/null || break
+    done
+
+    if panel_process_ready || {
+        PANEL_PROCESS_FALLBACK=1
+        panel_process_ready
+    }; then
+        echo "OK (PID $PID, listener/process ready, со второй попытки)"
+        return 0
+    fi
+
+    echo "FAILED"
+    echo "=== readiness === ${READINESS_REASON:-unknown}"
+    echo "=== last log ==="
+    tail -80 "$LOGFILE" 2>/dev/null
+    # Never leave a live Python worker after a failed readiness probe. It can
+    # bind later and make the next restart report a false/unstable result.
+    kill_app
+    wait_app_stopped
+    rm -f "$PIDFILE"
+    return 1
+}
+
+stop() {
+    printf 'Stopping %s... ' "$NAME"
+
+    if is_running; then
+        pidfile_values || PID=""
+        [ -n "${PID:-}" ] || PID=""
+        [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+
+        i=0
+        while [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; do
+            i=$((i + 1))
+            [ "$i" -ge 10 ] && {
+                kill -9 "$PID" 2>/dev/null || true
+                break
+            }
+            sleep 1
+        done
+    fi
+
+    kill_app
+    wait_app_stopped
+    rm -f "$PIDFILE"
+
+    echo "OK"
+    return 0
+}
+
+status() {
+    if is_running; then
+        pidfile_values
+        if panel_ready; then
+            echo "$NAME is running (PID $PID, listener ready)"
+            return 0
+        fi
+        echo "$NAME is running (PID $PID, listener probe unavailable)"
+        return 0
+    fi
+
+    rm -f "$PIDFILE"
+
+    PID="$(find_app_pid || true)"
+    if [ -n "$PID" ]; then
+        if write_pidfile "$PID" && panel_ready; then
+            echo "$NAME is running without pidfile (PID $PID, listener ready)"
+            return 0
+        fi
+        rm -f "$PIDFILE"
+        echo "$NAME process exists but listener is not ready"
+        return 1
+    fi
+
+    echo "$NAME is not running"
+    return 1
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    restart)
+        stop
+        sleep 1
+        start
+        ;;
+    status) status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

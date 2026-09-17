@@ -1,0 +1,33 @@
+#!/bin/sh
+
+ENABLED=yes
+PROCS=xray
+ARGS="run -confdir /opt/etc/$PROCS"
+PREARGS=""
+DESC=$PROCS
+PATH=/opt/sbin:/opt/bin:/opt/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONFIG=/opt/etc/xray/config.json
+
+# rc.func may invoke this script automatically after WAN up/reboot. A binary
+# alone is not a configured tunnel: never turn a template into a failed
+# daemon start or an open listener.
+key_config_ready() {
+    # A complete JSON can be a stale preserved config. Only a config written
+    # through the key/config panel receives this explicit readiness marker.
+    [ -f "/opt/etc/unblock/.configured/xray" ] || return 1
+    [ -s "$CONFIG" ] || return 1
+    grep -q '{{' "$CONFIG" 2>/dev/null && return 1
+    grep -qE '"(address|server|remote_addr|password|auth|id|publicKey)"[[:space:]]*:[[:space:]]*(""|\[[[:space:]]*""|\[\])' "$CONFIG" 2>/dev/null && return 1
+    return 0
+}
+case "${1:-start}" in
+    start|restart)
+        if ! key_config_ready; then
+            [ "${1:-start}" = restart ] && "$0" stop >/dev/null 2>&1 || true
+            echo "ключ не задан — сервис не запускается; добавьте ключ через бота или веб-панель" >&2
+            exit 0
+        fi
+        ;;
+esac
+
+. /opt/etc/init.d/rc.func
