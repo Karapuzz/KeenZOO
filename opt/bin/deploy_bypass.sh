@@ -575,12 +575,44 @@ ast.parse(new)
 # only known KeenZOO DNS/list entries with minute/five-minute cadence.
 command = re.compile(r'/opt/(?:etc/init\.d/S99unblock\b|etc/bot/utils\.py\s+--dns-[\w-]+\b|bin/(?:unblock_dnsmasq|unblock_update|unblock_ipset)\.sh\b)')
 frequent = {'*', '*/1', '*/5', '0-59/1', '0-59/5'}
+opt_base = config.parents[2]  # /opt on the router; fixture root on the stand
+
+def runparts_target(body):
+    m = re.search(r'(?:^|[\s/])run-parts[ \t]+(\S+)', body)
+    if not m:
+        return None
+    target = m.group(1).strip("\"'").split(';')[0].split('>')[0].split('<')[0]
+    stripped = target.lstrip('/')
+    if stripped.startswith('opt/'):
+        return opt_base.joinpath(stripped[4:])
+    return None
+
+def disable_empty_runparts(line, body):
+    # */1 and */5 run-parts entries with an empty/missing directory cost a
+    # process spawn every cycle and produce zero work: comment them, keep
+    # the original line for easy re-enable. Non-empty dirs are user-owned.
+    tpath = runparts_target(body)
+    if tpath is None or tpath.name not in ('cron.1min', 'cron.5mins'):
+        return line
+    try:
+        empty = not tpath.is_dir() or not any(tpath.iterdir())
+    except OSError:
+        empty = False
+    if empty:
+        if line.lstrip().startswith('#'):
+            return line
+        return line.replace(line.lstrip(), '# disabled by KeenZOO migration (empty run-parts dir): ' + line.lstrip(), 1)
+    print('WARNING: non-empty', tpath.name, '- run-parts entry kept:', line.strip())
+    return line
+
 def clean_cron(text):
     result = []
     for line in text.splitlines(keepends=True):
         fields = line.split()
         if not fields or line.lstrip().startswith('#'):
             result.append(line); continue
+        body = line.split('#', 1)[0]
+        line = disable_empty_runparts(line, body)
         body = line.split('#', 1)[0]
         owned_command = command.search(body)
         if owned_command and any(op in body for op in (';', '&&', '||', '|')):
@@ -601,6 +633,29 @@ for path in cron_paths:
         raise SystemExit('Refusing symlinked cron file: ' + str(path))
     text = path.read_text() if path.exists() else ''
     updates[path] = clean_cron(text)
+# Ensure canonical KeenZOO scheduled jobs exist (any cron file counts).
+# Presence is signature-based; a job on a user-chosen schedule is respected.
+KEENZOO_JOBS = [
+    (lambda body: 'unblock_update.sh' in body and 'REBUILD=1' not in body,
+     '00 06 * * * root /opt/bin/rotate_logs.sh >/dev/null 2>&1; /opt/bin/unblock_update.sh >>/tmp/unblock_update.log 2>&1; /opt/bin/rotate_logs.sh >/dev/null 2>&1'),
+    (lambda body: 'unblock_update.sh' in body and 'REBUILD=1' in body,
+     '00 03 * * 3 root /opt/bin/rotate_logs.sh >/dev/null 2>&1; REBUILD=1 /opt/bin/unblock_update.sh >>/tmp/unblock_update.log 2>&1; /opt/bin/rotate_logs.sh >/dev/null 2>&1'),
+    (lambda body: 'check_updates.sh' in body,
+     '0 3 * * * root /opt/bin/check_updates.sh >/dev/null 2>&1'),
+    (lambda body: 'rotate_logs.sh' in body and 'unblock_update.sh' not in body and 'check_updates.sh' not in body,
+     '30 */6 * * * root /opt/bin/rotate_logs.sh >/dev/null 2>&1'),
+]
+active_lines = [line for text in updates.values() for line in text.splitlines()
+                if line.strip() and not line.strip().startswith('#')]
+missing_jobs = [job for present, job in KEENZOO_JOBS
+                if not any(present(line) for line in active_lines)]
+if missing_jobs:
+    base = updates.get(cron, '')
+    base = base.rstrip(chr(10)) + (chr(10) if base else '')
+    base += '# KeenZOO scheduled jobs (migration):' + chr(10) + chr(10).join(missing_jobs) + chr(10)
+    updates[cron] = base
+    print('Ensured KeenZOO cron jobs:', len(missing_jobs))
+
 remove = []
 for directory in ('/opt/etc/cron.1min', '/opt/etc/cron.5mins'):
     root = pathlib.Path(directory)
