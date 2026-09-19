@@ -1,4 +1,8 @@
 #!/bin/sh
+# remove keeps data but disables cron/NDM reactivation until next install.
+if [ -f /opt/etc/unblock/.disabled ] && [ "${PURGE_PROJECT:-0}" != 1 ]; then
+    exit 0
+fi
 # /opt/etc/ndm/fs.d/100-ipset.sh — создание наборов ipset при монтировании
 # накопителя Entware, до старта сервисов и правил netfilter.
 set -eu

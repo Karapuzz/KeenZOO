@@ -39,41 +39,15 @@ def _load_gen():
 
 
 def _is_valid_cidr(entry):
-    m = re.match(
-        r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.'
-        r'(\d{1,3})/(\d{1,2})$', entry)
-    if not m:
-        return False
-    octets = [int(m.group(i)) for i in range(1, 5)]
-    prefix = int(m.group(5))
-    return (all(o <= 255 for o in octets)
-            and 0 <= prefix <= 32)
+    return _load_gen()._validate_cidr(entry)
 
 
 def _is_valid_ip(entry):
-    m = re.match(
-        r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.'
-        r'(\d{1,3})$', entry)
-    if not m:
-        return False
-    return all(
-        int(m.group(i)) <= 255
-        for i in range(1, 5))
+    return _load_gen()._validate_ip(entry)
 
 
 def _is_valid_entry(clean):
-    if '/' in clean:
-        return _is_valid_cidr(clean)
-    if _is_valid_ip(clean):
-        return True
-    if clean.startswith('#'):
-        return False
-    return bool(re.match(
-        r'^(\*\.)?[a-zA-Z0-9]'
-        r'([a-zA-Z0-9\-]*[a-zA-Z0-9])?'
-        r'(\.[a-zA-Z0-9]'
-        r'([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$',
-        clean))
+    return _load_gen()._validate_entry(clean) is not None
 
 
 class BotState:
@@ -499,10 +473,12 @@ def setup_handlers(bot):
             chat_id, MENU_BYPASS_FILES)
 
     def handle_bypass_files_selection(message):
-        filepath = (
-            f"{config.paths['unblock_dir']}"
-            f"{message.text}.txt")
-        if not os.path.exists(filepath):
+        filepath = os.path.join(
+            config.paths["unblock_dir"], f"{message.text}.txt")
+        root = os.path.realpath(config.paths['unblock_dir'])
+        if (not re.fullmatch(r'[^/\\\x00-\x1f]+', message.text or '')
+                or os.path.dirname(os.path.realpath(filepath)) != root
+                or not os.path.isfile(filepath)):
             bot.send_message(
                 message.chat.id,
                 "❌ Неверный выбор",
@@ -536,9 +512,8 @@ def setup_handlers(bot):
 
     def handle_bypass_list_menu(message):
         selected = state.get_file(message.chat.id)
-        filepath = (
-            f"{config.paths['unblock_dir']}"
-            f"{selected}.txt")
+        filepath = os.path.join(
+            config.paths["unblock_dir"], f"{selected}.txt")
         if message.text == "📄 Показать список":
             sections = load_bypass_blocks(filepath)
             text = format_blocks_for_display(
@@ -574,11 +549,20 @@ def setup_handlers(bot):
                 reply_markup=(
                     MENU_BYPASS_LIST.markup))
 
+    def locked_list_edit(func):
+        def wrapped(message):
+            try:
+                with _load_gen().shared_update_lock():
+                    return func(message)
+            except (RuntimeError, OSError, ValueError) as err:
+                bot.send_message(message.chat.id, f"❌ Изменение списка: {err}")
+        return wrapped
+
+    @locked_list_edit
     def handle_add_to_bypass(message):
         selected = state.get_file(message.chat.id)
-        filepath = (
-            f"{config.paths['unblock_dir']}"
-            f"{selected}.txt")
+        filepath = os.path.join(
+            config.paths["unblock_dir"], f"{selected}.txt")
         existing_sections = load_bypass_blocks(
             filepath)
         existing_clean_map = {}
@@ -711,11 +695,11 @@ def setup_handlers(bot):
             MENU_BYPASS_LIST,
             "Меню " + selected)
 
+    @locked_list_edit
     def handle_remove_from_bypass(message):
         selected = state.get_file(message.chat.id)
-        filepath = (
-            f"{config.paths['unblock_dir']}"
-            f"{selected}.txt")
+        filepath = os.path.join(
+            config.paths["unblock_dir"], f"{selected}.txt")
         to_remove = {
             get_clean_entry(line)
             for line in message.text.split('\n')

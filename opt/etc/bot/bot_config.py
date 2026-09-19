@@ -36,16 +36,13 @@ vpn_allowed = "IKE|SSTP|OpenVPN|Wireguard|L2TP"
 # Пин обновляется при каждом штатном запуске unblock_dnsmasq.sh.
 pin_server_hosts = True
 
-# Порядок выбора DNS-пути:
-#   1) локальные DNSSEC-порты;
-#   2) tunnel-DNS через Xray/VLESS -> Trojan -> Hysteria;
-#   3) DNS без AD только после неудачи tunnel-DNS;
-#   4) для cold-start pinning: 40500, DNS провайдера, затем bootstrap.
-# Bootstrap IP используются только для холодного старта и не являются
-# рабочим DNSSEC-режимом. Shell-слои читают эти контракты напрямую.
+# DNS policy v4: fastest validated Primary -> next DNSSEC backup ->
+# Hysteria -> Xray -> Trojan -> authorized emergency public DNS TCP/UDP53.
+# Preferred Primary survives fallback and is restored after positive checks.
+# These bootstrap IPv4 addresses are also the ordered emergency client pool.
 bootstrap_resolvers = ['9.9.9.9', '8.8.8.8', '1.1.1.1']
 tunnel_doh_hosts = ['dns.google', 'cloudflare-dns.com', 'dns11.quad9.net']
-tunnel_protocol_priority = ['xray', 'trojan', 'hysteria']
+tunnel_protocol_priority = ['hysteria', 'xray', 'trojan']
 # Возраст pin в секундах: мягкий предел для diagnostics/recovery и жёсткий
 # предел, после которого адрес не потребляется.
 pin_max_age = 604800
@@ -67,15 +64,14 @@ localportvless = 10810
 localporttrojan = 10829
 localporthysteria = 10830
 # Порт, куда перенаправляется собственный трафик роутера (bot.txt).
-# Совпадает с localportvless: трафик роутера идёт через xray.
+# Legacy default. Web selection is stored in /opt/etc/unblock/.router_protocol
+# (xray/trojan/hysteria); netfilter uses the selected local protocol port.
 localportrouter = localportvless
 dnsovertls_ports = [40500, 40501, 40502, 40503]
 dnsoverhttps_ports = [40508, 40509, 40510, 40511]
-# DNS-клиенты используют системные DoT/DoH-порты через dnsmasq.
-# Внешние TCP/443 и TCP/853 соединения этих proxy перенаправляются
-# unblock_dnsmasq.sh в активный Xray/Trojan/Hysteria tunnel.
-# Список endpoint-ов можно переопределить переменной DNS_ENDPOINT_HOSTS;
-# IP никогда не зашиваются в конфигурацию.
+# dnsmasq uses stable loopback facade 127.0.0.1:40512 (utils.py controller).
+# Local DoT/DoH candidates are never auto-redirected just for an active proxy.
+# Tunnel fallback uses explicitly marked TCP DNS through tcpRedirect/dokodemo.
 dns_endpoint_hosts = ['dns11.quad9.net', 'dns.google', 'cloudflare-dns.com', 'opennic1.eth-services.de', 'opennic2.eth-services.de']
 
 ipset_names = {
@@ -230,3 +226,10 @@ backup_settings = {
         paths["bot_list"],
     ]),
 }
+# Hybrid DNS policy: monotonic idle/recovery timers, calendar pool in router TZ.
+# AD is upstream validation evidence, NOT local signature verification; AA ignored.
+dns_policy_version = 4
+dns_policy_mode = 'hybrid'
+dns_policy_interval = 3600
+dns_policy_pool_hours = [11, 23]
+dns_policy_recovery_interval = 300

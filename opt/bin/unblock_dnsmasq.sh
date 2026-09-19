@@ -1,8 +1,74 @@
 #!/bin/sh
+# remove keeps data but disables cron/NDM reactivation until next install.
+if [ -f /opt/etc/unblock/.disabled ] && [ "${PURGE_PROJECT:-0}" != 1 ]; then
+    exit 0
+fi
 set -eu
 
 PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 umask 022
+
+# A BusyBox executable does NOT imply that its timeout applet is compiled in.
+# 125 = no usable deadline runner; 124 = deadline; 126/127 = not executed.
+run_bounded() {
+    _rb_seconds="$1"
+    shift
+    if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_rb_seconds" "$@" <<'PY_DEADLINE'
+import os
+import signal
+import subprocess
+import sys
+
+proc = None
+
+def stop_group():
+    if proc is None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+
+def interrupted(sig, frame):
+    raise SystemExit(128 + sig)
+
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, interrupted)
+try:
+    proc = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        rc = proc.wait(timeout=float(sys.argv[1]))
+    except subprocess.TimeoutExpired:
+        rc = 124
+except OSError as exc:
+    rc = 127 if isinstance(exc, FileNotFoundError) else 126
+finally:
+    stop_group()
+sys.exit(rc if rc >= 0 else 128 - rc)
+PY_DEADLINE
+        return $?
+    fi
+    # Early bootstrap may not have Python yet. Require a working kill-after
+    # option rather than trusting either a symlink or a BusyBox version.
+    if command -v timeout >/dev/null 2>&1 \
+        && timeout -k 1 1 /bin/sh -c ':' >/dev/null 2>&1; then
+        timeout -k 1 "$_rb_seconds" "$@"
+        return $?
+    fi
+    if command -v busybox >/dev/null 2>&1 \
+        && busybox timeout -k 1 1 /bin/sh -c ':' >/dev/null 2>&1; then
+        busybox timeout -k 1 "$_rb_seconds" "$@"
+        return $?
+    fi
+    return 125
+}
 
 # Keep runtime port lists in step with the existing deploy configuration.
 # Parsing is intentionally simple and BusyBox-compatible; missing values keep
@@ -29,7 +95,7 @@ config_list() {
     _cl_default="$2"
     _cl_value="$(sed -n \
         "s/^[[:space:]]*${_cl_key}[[:space:]]*=[[:space:]]*\\[\\(.*\\)\\].*$/\\1/p" \
-        /opt/etc/bot/bot_config.py 2>/dev/null | tr -cd '0-9 ' | sed 's/[[:space:]][[:space:]]*/ /g')"
+        /opt/etc/bot/bot_config.py 2>/dev/null | tr ',' ' ' | tr -cd '0-9 ' | sed 's/[[:space:]][[:space:]]*/ /g')"
     [ -n "$_cl_value" ] || _cl_value="$_cl_default"
     printf '%s\n' "$_cl_value"
 }
@@ -48,7 +114,7 @@ config_words() {
 
 # Keep the protocol fallback order in the install-time Python configuration;
 # every shell decision layer consumes this same ordered contract.
-TUNNEL_PROTOCOL_PRIORITY="$(config_words tunnel_protocol_priority 'xray trojan hysteria')"
+TUNNEL_PROTOCOL_PRIORITY="$(config_words tunnel_protocol_priority 'hysteria xray trojan')"
 
 config_string() {
     _cs_key="$1"
@@ -78,6 +144,7 @@ CIDR_FILE="/opt/etc/unblock.dnsmasq.cidr"
 # is introduced.
 DNS_HEALTH_ONLY="${DNS_HEALTH_ONLY:-0}"
 
+
 # Validate the complete CIDR/range interval, not only its first address.
 is_public_cidr() {
     _ipc_entry="$1"
@@ -105,6 +172,8 @@ is_public_cidr() {
                 overlap(first,last,2886729728,2887778303) ||
                 overlap(first,last,3221225472,3221225727) ||
                 overlap(first,last,3221225984,3221226239) ||
+                overlap(first,last,3232235520,3232301055) ||
+                overlap(first,last,3323068416,3323199487) ||
                 overlap(first,last,3325256704,3325256959) ||
                 overlap(first,last,3405803776,3405804031) ||
                 overlap(first,last,3758096384,4294967295)) exit 1
@@ -138,6 +207,8 @@ is_public_range() {
                 overlap(first,last,2886729728,2887778303) ||
                 overlap(first,last,3221225472,3221225727) ||
                 overlap(first,last,3221225984,3221226239) ||
+                overlap(first,last,3232235520,3232301055) ||
+                overlap(first,last,3323068416,3323199487) ||
                 overlap(first,last,3325256704,3325256959) ||
                 overlap(first,last,3405803776,3405804031) ||
                 overlap(first,last,3758096384,4294967295)) exit 1
@@ -219,13 +290,62 @@ export KEENZOO_LOCK_DIR KEENZOO_UPDATE_LOCK_HELD
 TMP_OUT="$(mktemp /tmp/unblock.dnsmasq.XXXXXX)"
 TMP_CIDR="$(mktemp /tmp/unblock.dnsmasq.cidr.XXXXXX)"
 
+DNS_CONFIG_BACKUP=''
+DNS_TX_READY=0
+DNS_TX_DONE=0
 cleanup() {
-    rm -f "$TMP_OUT" "$TMP_CIDR"
+    _dns_exit_rc="${1:-$?}"
+    if [ "$_dns_exit_rc" -ne 0 ] && [ "$DNS_TX_DONE" -eq 0 ]; then
+        if [ "$DNS_TX_READY" -eq 1 ]; then
+            for _dcr_name in main domains cidr; do
+                case "$_dcr_name" in
+                    main) _dcr_file="$DNSMASQ_CONF" ;;
+                    domains) _dcr_file="$OUT_FILE" ;;
+                    cidr) _dcr_file="$CIDR_FILE" ;;
+                esac
+                if [ -f "$DNS_CONFIG_BACKUP/$_dcr_name" ]; then
+                    cp -p "$DNS_CONFIG_BACKUP/$_dcr_name" "${_dcr_file}.rollback.$$" \
+                        && mv -f "${_dcr_file}.rollback.$$" "$_dcr_file" \
+                        || logger -t unblock_dnsmasq "DNS file rollback failed: $_dcr_file"
+                else
+                    rm -f "$_dcr_file"
+                fi
+            done
+            # This only restores the DNS files/listener; the parent update owns
+            # ipset/netfilter rollback when invoked as a staged child.
+            if [ "${KEENZOO_SKIP_DNSMASQ_RELOAD:-0}" != 1 ] \
+                && [ -x /opt/etc/init.d/S56dnsmasq ]; then
+                /opt/etc/init.d/S56dnsmasq restart >/dev/null 2>&1 || true
+            fi
+        fi
+        if command -v publish_dns_failure >/dev/null 2>&1; then
+            publish_dns_failure || true
+        fi
+    fi
+    [ -z "$DNS_CONFIG_BACKUP" ] || rm -rf "$DNS_CONFIG_BACKUP"
+    rm -f "$TMP_OUT" "$TMP_CIDR" "${TMP_OUT}.sorted" "${TMP_CIDR}.sorted" \
+        "${DNSMASQ_CONF}.upstream.$$" "${DNSMASQ_CONF}.tmp.$$" \
+        "${OUT_FILE}.upstreams.$$"
     if [ "$LOCK_ACQUIRED" -eq 1 ]; then
         rm -rf "$KEENZOO_LOCK_DIR"
     fi
 }
-trap cleanup EXIT INT TERM HUP
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+DNS_CONFIG_BACKUP="$(mktemp -d /tmp/keenzoo.dns-config.XXXXXX)"
+chmod 700 "$DNS_CONFIG_BACKUP"
+for _dcb_pair in main domains cidr; do
+    case "$_dcb_pair" in
+        main) _dcb_file="$DNSMASQ_CONF" ;;
+        domains) _dcb_file="$OUT_FILE" ;;
+        cidr) _dcb_file="$CIDR_FILE" ;;
+    esac
+    [ ! -f "$_dcb_file" ] || cp -p "$_dcb_file" "$DNS_CONFIG_BACKUP/$_dcb_pair"
+done
+DNS_TX_READY=1
 
 : > "$TMP_OUT"
 : > "$TMP_CIDR"
@@ -242,9 +362,13 @@ update_dynamic_interfaces() {
     # client interfaces first, then currently existing LAN/WireGuard devices.
     # WAN names are deliberately not discovered by this pattern.
     _udi_ifaces="lo"
+    # Some firmware ip variants return success even when a name filter is
+    # ignored. Match exact names in one dump, not the command exit status.
+    _udi_links="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
+        | sed 's/@.*//' | tr '\n' ' ')"
     _udi_add_if() {
         [ -n "$1" ] || return 0
-        ip link show "$1" >/dev/null 2>&1 || return 0
+        case " $_udi_links " in *" $1 "*) ;; *) return 0 ;; esac
         case " $_udi_ifaces " in
             *" $1 "*) ;;
             *) _udi_ifaces="${_udi_ifaces} $1" ;;
@@ -274,6 +398,7 @@ update_dynamic_interfaces() {
         _udi_local="$_udi_router"
     else
         for _udi_if in $_udi_ifaces; do
+            [ "$_udi_if" = lo ] && continue
             _udi_local="$(ip -4 addr show "$_udi_if" 2>/dev/null \
                 | awk '/inet /{print $2; exit}' | cut -d/ -f1)"
             [ -n "$_udi_local" ] && break
@@ -291,6 +416,7 @@ update_dynamic_interfaces() {
     # interface prefix. This removes the old 192.168.1.0/24 assumption.
     _udi_domain=""
     for _udi_if in $_udi_ifaces; do
+        [ "$_udi_if" = lo ] && continue
         _udi_cidr="$(ip -4 addr show "$_udi_if" 2>/dev/null \
             | awk '/inet /{print $2; exit}')"
         [ -n "$_udi_cidr" ] || continue
@@ -382,7 +508,9 @@ is_public_ipv4() {
             if (a == 169 && b == 254) bad=1
             if (a == 172 && b >= 16 && b <= 31) bad=1
             if (a == 192 && b == 168) bad=1
-            if (a == 192 && b == 0) bad=1
+            if (a == 192 && b == 0 && ($3 == 0 || $3 == 2)) bad=1
+            if (a == 198 && b == 51 && $3 == 100) bad=1
+            if (a == 203 && b == 0 && $3 == 113) bad=1
             if (a == 198 && (b == 18 || b == 19)) bad=1
             if (a >= 224) bad=1
         }
@@ -673,18 +801,22 @@ tunnel_dns_prepare() {
             _tdp_ips="${_tdp_ips}${_tdp_ips:+ }$_tdp_ip"
         done
     done
-    [ -n "$_tdp_ips" ] || return 1
+    [ -n "$_tdp_ips" ] || {
+        dns_health_file_log "tunnel prepare proto=$_tdp_proto failed=NO_ENDPOINT_PINS"
+        return 1
+    }
 
     ipset swap "$DNS_TUNNEL_SET" "$_tdp_stage" 2>/dev/null || return 1
     if [ -x /opt/etc/ndm/netfilter.d/100-redirect.sh ]; then
         for _tdp_table in nat filter; do
             if ! DNS_TUNNEL_PROTOCOL="$_tdp_proto" \
                 DNS_TUNNEL_VERIFIED=1 DNS_TUNNEL_BLOCK_RAW_DNS=1 \
-                type=iptable table="$_tdp_table" \
+                DNS_ONLY=1 type=iptable table="$_tdp_table" \
                 /opt/etc/ndm/netfilter.d/100-redirect.sh >/dev/null 2>&1; then
+                dns_health_file_log "tunnel prepare proto=$_tdp_proto failed=NETFILTER table=$_tdp_table"
                 for _tdp_off_table in filter nat; do
                     DNS_TUNNEL_DISABLE=1 DNS_TUNNEL_BLOCK_RAW_DNS=0 \
-                        type=iptable table="$_tdp_off_table" \
+                        DNS_ONLY=1 type=iptable table="$_tdp_off_table" \
                         /opt/etc/ndm/netfilter.d/100-redirect.sh >/dev/null 2>&1 || true
                 done
                 ipset swap "$DNS_TUNNEL_SET" "$_tdp_stage" 2>/dev/null || true
@@ -708,10 +840,11 @@ tunnel_dns_prepare() {
             --dport "$_tdp_remote_port" \
             -m set --match-set "$DNS_TUNNEL_SET" dst \
             -j REDIRECT --to-port "$_tdp_port" >/dev/null 2>&1; then
-            _tdp_rule_ok=1
+            _tdp_rule_ok=$((_tdp_rule_ok + 1))
         fi
     done
-    if [ "$_tdp_rule_ok" -ne 1 ]; then
+    if [ "$_tdp_rule_ok" -ne 2 ]; then
+        dns_health_file_log "tunnel prepare proto=$_tdp_proto failed=REDIRECT_NOT_INSTALLED"
         ipset swap "$DNS_TUNNEL_SET" "$_tdp_stage" 2>/dev/null || true
         return 1
     fi
@@ -829,12 +962,14 @@ dns_health_probe() {
     DNS_LAST_REASON=""
     DNS_LAST_STATUS=""
     DNS_LAST_FLAGS=""
-    _dhp_out="$(dig +dnssec +noall +comments +answer +stats \
-        +time=2 +tries=1 "$DNS_HEALTH_DOMAIN" \
-        @localhost -p "$_dhp_port" 2>/dev/null || true)"
-    _dhp_status="$(printf '%s\n' "$_dhp_out" \
-        | sed -n 's/.*status:[[:space:]]*\([^,;]*\).*/\1/p' \
-        | head -1)"
+    for _dhp_attempt in 1 2; do
+        _dhp_out="$(dig -4 +dnssec +noall +comments +answer +stats \
+            +time=2 +tries=1 "$DNS_HEALTH_DOMAIN" A \
+            @127.0.0.1 -p "$_dhp_port" 2>/dev/null || true)"
+        _dhp_status="$(printf '%s\n' "$_dhp_out" \
+            | sed -n 's/.*status:[[:space:]]*\([^,;]*\).*/\1/p' | head -1)"
+        [ "$_dhp_status" != NOERROR ] || break
+    done
     _dhp_flags="$(printf '%s\n' "$_dhp_out" \
         | sed -n 's/.*flags:[[:space:]]*\([^;]*\).*/\1/p' \
         | head -1)"
@@ -861,12 +996,7 @@ dns_health_probe() {
         DNS_LAST_REASON="no_a"
         return 1
     fi
-    case " $_dhp_flags " in
-        *" aa "*)
-            DNS_LAST_REASON="authoritative"
-            return 1
-            ;;
-    esac
+    # AA is orthogonal to DNSSEC: only AD distinguishes validated answers.
     case " $_dhp_flags " in
         *" ad "*)
             DNS_LAST_REASON="validated"
@@ -936,17 +1066,26 @@ dns_health_file_log() {
     dns_health_log_rotate
     _dhl_now="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)"
     _dhl_epoch="$(date +%s 2>/dev/null || echo 0)"
+    # A truncated previous write must not concatenate with the next epoch.
+    if [ -s "$DNS_HEALTH_LOG" ] && [ -n "$(tail -c 1 "$DNS_HEALTH_LOG" 2>/dev/null)" ]; then
+        printf '\n' >> "$DNS_HEALTH_LOG" || return 1
+    fi
     printf '%s unblock_dnsmasq epoch=%s %s\n' "$_dhl_now" "$_dhl_epoch" "$*" \
-        >> "$DNS_HEALTH_LOG" 2>/dev/null || true
+        >> "$DNS_HEALTH_LOG" 2>/dev/null || return 1
     dns_health_log_rotate
 }
 
 DNS_METRICS_FILE="$(mktemp /tmp/unblock.dns.metrics.XXXXXX)"
 cleanup_dns_metrics() {
-    cleanup
+    _cdm_rc=$?
+    cleanup "$_cdm_rc"
     rm -f "$DNS_METRICS_FILE" "${DNS_METRICS_FILE}.ranked" "${DNS_METRICS_FILE}.remaining" "${DNS_METRICS_FILE}.next"
+    return "$_cdm_rc"
 }
-trap cleanup_dns_metrics EXIT INT TERM HUP
+trap cleanup_dns_metrics EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # BusyBox sort on some Keenetic builds accepts the options but does not
 # apply a numeric field key. Select the minimum explicitly with awk and
@@ -1045,6 +1184,29 @@ probe_all_dns_ports() {
         "ranking=${DNS_RANKING:-none} primary=${DNS_PRIMARY:-none} primary_rtt=${DNS_PRIMARY_RTT_MS:-none} secure=${DNS_SECURE_PORTS:-none} insecure=${DNS_INSECURE_PORTS:-none}"
 }
 
+# v4 delegates ONLY resolver selection/forwarding to the bounded controller.
+# All existing domain/ipset/interface/pin generation stays in this owner.
+DNS_POLICY_V4=1
+v4_load_dns() {
+    _v4_state="$(python3 /opt/etc/bot/utils.py --dns-shell)" || return 1
+    eval "$_v4_state"
+}
+v4_start_dns() {
+    for _v4_table in filter nat; do
+        DNS_ONLY=1 type=iptable table="$_v4_table" \
+            /opt/etc/ndm/netfilter.d/100-redirect.sh || return 1
+    done
+    python3 /opt/etc/bot/utils.py --dns-start || return 1
+    _v4_wait=0
+    while [ "$_v4_wait" -lt 60 ]; do
+        v4_load_dns || return 1
+        [ "$DNS_MODE" != DNS_UNAVAILABLE ] && return 0
+        sleep 1
+        _v4_wait=$((_v4_wait + 1))
+    done
+    # Keep the controller alive for cold-start pins and subsequent recovery.
+    return 0
+}
 DNS_SECURE_PORTS=""
 DNS_INSECURE_PORTS=""
 DNS_WORKING_PORTS=""
@@ -1052,7 +1214,7 @@ DNS_PRIMARY=""
 DNS_BACKUP_PORTS=""
 DNS_PRIMARY_RTT_MS=""
 DNS_RANKING=""
-probe_all_dns_ports
+v4_start_dns
 DNS_INITIAL_SECURE_PORTS="$DNS_SECURE_PORTS"
 # Keep the pre-tunnel DNSSEC listeners available for one narrowly-scoped
 # cold-start operation: resolving only proxy/DNS endpoint names needed to
@@ -1103,7 +1265,7 @@ try_tunnel_dns() {
     if [ -x /opt/etc/ndm/netfilter.d/100-redirect.sh ]; then
         for _dns_off_table in filter nat; do
             DNS_TUNNEL_DISABLE=1 DNS_TUNNEL_BLOCK_RAW_DNS=0 \
-                type=iptable table="$_dns_off_table" \
+                DNS_ONLY=1 type=iptable table="$_dns_off_table" \
                 /opt/etc/ndm/netfilter.d/100-redirect.sh >/dev/null 2>&1 || true
         done
     fi
@@ -1111,33 +1273,10 @@ try_tunnel_dns() {
     return 1
 }
 
-# A running tunnel is a special case: even if a local listener answered
-# before the tunnel was selected, its DoH/DoT endpoint traffic must be
-# prepared and redirected through that tunnel. The active check requires both
-# the exact daemon process and its local listener, so a stale PID cannot force
-# fail-closed DNS during cold start. We do not start a tunnel just because
-# local DNSSEC works; we only reuse one that is already active or use it after
-# all local DNSSEC ports failed.
-DNS_ACTIVE_TUNNEL="$(required_tunnel_protocol || true)"
-DNS_TUNNEL_REQUIRED=0
-[ -n "$DNS_ACTIVE_TUNNEL" ] && DNS_TUNNEL_REQUIRED=1
-if [ "$DNS_TUNNEL_REQUIRED" -eq 0 ] \
-    && [ -x /opt/etc/ndm/netfilter.d/100-redirect.sh ]; then
-    # Remove stale tunnel-DNS redirect/raw-DNS fail-closed rules after a
-    # tunnel has been intentionally stopped. This is idempotent.
-    for _dns_off_table in filter nat; do
-        DNS_TUNNEL_DISABLE=1 DNS_TUNNEL_BLOCK_RAW_DNS=0 \
-            type=iptable table="$_dns_off_table" \
-            /opt/etc/ndm/netfilter.d/100-redirect.sh >/dev/null 2>&1 || true
-    done
-    clear_tunnel_dns_set
-fi
-DNS_TUNNEL_READY=0
-if [ -z "$DNS_INITIAL_SECURE_PORTS" ] || [ "$DNS_TUNNEL_REQUIRED" -eq 1 ]; then
-    try_tunnel_dns || true
-fi
+# Live mode already belongs to the v4 controller.
 
 select_dns_mode() {
+    if [ "${DNS_POLICY_V4:-0}" = 1 ]; then v4_load_dns; return $?; fi
     # Tunnel state has priority over the fact that the tunnel makes a local
     # listener answer with AD. Otherwise a successful tunnel check would be
     # mislabeled LOCAL_DNSSEC and the fallback chain would be invisible.
@@ -1203,7 +1342,7 @@ update_dnsmasq_upstreams() {
     # 40500 is a final local fallback only when no tunnel is active. Never
     # add it to the upstream set while tunnel DNS is required: that would
     # silently reintroduce a direct DNS path.
-    if [ "$DNS_TUNNEL_REQUIRED" -eq 0 ] && [ -z "$DNS_WORKING_PORTS" ]; then
+    if [ "${DNS_POLICY_V4:-0}" != 1 ] && [ "$DNS_TUNNEL_REQUIRED" -eq 0 ] && [ -z "$DNS_WORKING_PORTS" ]; then
         _udu_add_port 40500
     fi
 
@@ -1222,6 +1361,9 @@ update_dnsmasq_upstreams() {
         }
         $0 == b { skip = 1; next }
         $0 == e { skip = 0; emit(); next }
+        # Older project templates put strict-order outside the managed block.
+        # Normalize the legacy duplicate without changing ordered selection.
+        /^[[:space:]]*strict-order[[:space:]]*(#.*)?$/ { next }
         !skip { print }
         END { if (!inserted) emit() }
     ' "$DNSMASQ_CONF" > "$_udu_tmp"
@@ -1239,12 +1381,30 @@ reload_dnsmasq() {
         }
     fi
     _rdm_pids="$(pidof dnsmasq 2>/dev/null || true)"
-    [ -n "$_rdm_pids" ] || return 0
-    kill -HUP $_rdm_pids 2>/dev/null || {
-        logger -t "unblock_dnsmasq" "reload failed: dnsmasq HUP" 2>/dev/null || true
-        return 1
-    }
+    if [ "${1:-config}" = hosts ]; then
+        [ -n "$_rdm_pids" ] || return 0
+        # SIGHUP reloads hosts, NOT dnsmasq.conf / conf-file directives.
+        kill -HUP $_rdm_pids 2>/dev/null || return 1
+    else
+        if [ -n "$_rdm_pids" ] && [ -n "${DNS_CONFIG_BACKUP:-}" ] \
+            && cmp -s "$DNS_CONFIG_BACKUP/main" "$DNSMASQ_CONF" \
+            && { cmp -s "$DNS_CONFIG_BACKUP/domains" "$OUT_FILE" \
+                 || { [ ! -e "$DNS_CONFIG_BACKUP/domains" ] && [ ! -e "$OUT_FILE" ]; }; }; then
+            return 0
+        fi
+        _rdm_action=restart
+        [ -n "$_rdm_pids" ] || _rdm_action=start
+        /opt/etc/init.d/S56dnsmasq "$_rdm_action" >/dev/null 2>&1 || return 1
+        pidof dnsmasq >/dev/null 2>&1 || return 1
+    fi
     return 0
+}
+
+dnsmasq_query_ready() {
+    dig -4 +short +time=3 +tries=2 "$DNS_HEALTH_DOMAIN" A @127.0.0.1 -p 53 2>/dev/null \
+        | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && return 0
+    dns_health_file_log "dnsmasq client-plane failed=NO_IPV4_ANSWER port=53"
+    return 1
 }
 
 write_final_dns_snapshot() {
@@ -1253,20 +1413,80 @@ write_final_dns_snapshot() {
     _dns_secure_log="$(printf '%s' "${DNS_SECURE_PORTS:-none}" | tr ' ' ',')"
     _dns_insecure_log="$(printf '%s' "${DNS_INSECURE_PORTS:-none}" | tr ' ' ',')"
     dns_health_file_log \
-        "decision=final mode=$DNS_MODE level=$DNS_PRIMARY_LEVEL required=$DNS_TUNNEL_REQUIRED verified=$DNS_TUNNEL_READY primary=${DNS_PRIMARY:-none} primary_rtt=${DNS_PRIMARY_RTT_MS:-none} ports=$_dns_ports_log secure=$_dns_secure_log insecure=$_dns_insecure_log backups=$_dns_backups_log ranking=${DNS_RANKING:-none} tunnel=${DNS_TUNNEL_PROTOCOL:-none}"
+        "decision=final mode=$DNS_MODE level=$DNS_PRIMARY_LEVEL required=$DNS_TUNNEL_REQUIRED verified=$DNS_TUNNEL_READY primary=${DNS_PRIMARY:-none} primary_rtt=${DNS_PRIMARY_RTT_MS:-none} ports=$_dns_ports_log secure=$_dns_secure_log insecure=$_dns_insecure_log backups=$_dns_backups_log ranking=${DNS_RANKING:-none} tunnel=${DNS_TUNNEL_PROTOCOL:-none} client=${DNS_CLIENT_STATE:-unknown}"
 }
 
-if [ "$DNS_HEALTH_ONLY" = "1" ]; then
-    # The health snapshot is the panel/ipset contract. Update only the managed
-    # dnsmasq upstream block and reload it; do not run the full resource-list
-    # rebuild during this event refresh.
-    update_dnsmasq_upstreams
-    reload_dnsmasq || exit 1
-    write_final_dns_snapshot
-    exit 0
-fi
 
-update_dnsmasq_upstreams
+publish_dns_failure() {
+    DNS_MODE=DNS_UNAVAILABLE
+    DNS_PRIMARY_LEVEL=DNS_UNAVAILABLE
+    DNS_TUNNEL_READY=0
+    DNS_WORKING_PORTS=''
+    DNS_SECURE_PORTS=''
+    DNS_INSECURE_PORTS=''
+    DNS_PRIMARY=''
+    DNS_BACKUP_PORTS=''
+    DNS_PRIMARY_RTT_MS=''
+    DNS_CLIENT_STATE=failed
+    write_final_dns_snapshot
+}
+
+# Update only generated local DNS server lines, not ipset/CIDR/resource lists,
+# Tor (9053), foreign endpoints, or user overrides in the main config.
+refresh_domain_upstreams() {
+    [ -f "$OUT_FILE" ] || return 0
+    _rdu_tmp="${OUT_FILE}.upstreams.$$"
+    _rdu_managed="40500 40501 40502 40503 40508 40509 40510 40511 $DNS_PORTS_DOT $DNS_PORTS_DOH"
+    if [ -r "$DNS_CONFIG_BACKUP/main" ]; then
+        _rdu_managed="$_rdu_managed $(awk -v b="$DNS_UPSTREAM_BEGIN" -v e="$DNS_UPSTREAM_END" '
+            $0==b {inside=1; next} $0==e {inside=0}
+            inside && /^server=127\.0\.0\.1#[0-9]+$/ {
+                sub(/^server=127\.0\.0\.1#/, ""); print
+            }' "$DNS_CONFIG_BACKUP/main")"
+    fi
+    awk -v ports="$DNS_WORKING_PORTS" -v managed="$_rdu_managed" '
+        BEGIN { n=split(ports,p," "); k=split(managed,m," "); for(i=1;i<=k;i++) own[m[i]]=1 }
+        FILENAME==ARGV[1] {
+            if ($0 ~ /^[[:space:]]*server=\//) {
+                line=$0; sub(/^[[:space:]]*server=\//,"",line)
+                zc=split(line,z,"/"); for(i=1;i<zc;i++) overrides[tolower(z[i])]=1
+            }
+            next
+        }
+        /^server=\/[^\/]+\/127\.0\.0\.1#[0-9]+$/ {
+            split($0,a,"/"); port=a[3]; sub(/^127\.0\.0\.1#/,"",port)
+            if (port != "9053" && (port in own)) {
+                zone=tolower(a[2]); covered=0
+                for(o in overrides) if(o!="" && (zone==o ||
+                    (length(zone)>length(o) && substr(zone,length(zone)-length(o))=="." o))) covered=1
+                if (!seen[zone]++ && !covered) for(i=1;i<=n;i++) if(p[i]!="")
+                    print "server=/" a[2] "/127.0.0.1#" p[i]
+                next
+            }
+        }
+        { print }
+    ' "$DNSMASQ_CONF" "$OUT_FILE" > "$_rdu_tmp" || return 1
+    chmod 0644 "$_rdu_tmp" || return 1
+    mv -f "$_rdu_tmp" "$OUT_FILE"
+}
+
+finish_dns_apply() {
+    if [ "${KEENZOO_SKIP_DNSMASQ_RELOAD:-0}" = 1 ]; then
+        # Only the parent orchestrator can use an uncommitted decision, in a
+        # private rollback directory. Never expose staged success to the UI.
+        [ "${KEENZOO_DNS_STAGE:-0}" = 1 ] || return 1
+        DNS_CLIENT_STATE=staged
+    else
+        reload_dnsmasq || return 1
+        dnsmasq_query_ready || return 1
+        DNS_CLIENT_STATE=ok
+    fi
+    write_final_dns_snapshot || return 1
+    DNS_TX_DONE=1
+}
+
+# Do not publish/apply the preliminary decision. Bootstrap pins and retry
+# the selected tunnel first, including health-only/WAN/UI refreshes.
 
 logger -t "unblock_dnsmasq" \
     "DNS primary=${DNS_PRIMARY:-none} primary_rtt=${DNS_PRIMARY_RTT_MS:-none} backups=${DNS_BACKUP_PORTS:-none} ranking=${DNS_RANKING:-none} mode=$DNS_MODE level=$DNS_PRIMARY_LEVEL tunnel=${DNS_TUNNEL_PROTOCOL:-none} health_domain=$DNS_HEALTH_DOMAIN"
@@ -1303,6 +1523,29 @@ HOSTS_FILE="${HOSTS_FILE:-/opt/etc/hosts}"
 # Возврат 0 означает, что транспорт пригоден для bootstrap:
 #   HTTP 2xx/3xx, либо ожидаемый 400/405 на пустой DoH-запрос,
 #   либо успешный TLS для DoT. 403/5xx не считаются рабочим DNS.
+ndm_dot_tls_probe() {
+    if command -v openssl >/dev/null 2>&1; then
+        run_bounded 7 openssl s_client -connect "${2}:853" \
+            -servername "$1" -verify_return_error -verify_hostname "$1" \
+            </dev/null >/dev/null 2>&1
+        return $?
+    fi
+    command -v python3 >/dev/null 2>&1 || return 127
+    # Python ssl uses the CA store and checks SNI/hostname, not just TCP connect.
+    # Pass code with -c: run_bounded deliberately closes child stdin.
+    run_bounded 7 python3 -c '
+import ipaddress, socket, ssl, sys
+host, address = sys.argv[1:]
+ipaddress.IPv4Address(address)
+context = ssl.create_default_context()
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw:
+    raw.settimeout(3)
+    raw.connect((address, 853))
+    with context.wrap_socket(raw, server_hostname=host):
+        pass
+' "$1" "$2" </dev/null >/dev/null 2>&1
+}
+
 ndm_endpoint_reachable() {
     _ner_host="$1"
     _ner_ip="$2"
@@ -1312,14 +1555,19 @@ ndm_endpoint_reachable() {
     esac
 
     if [ "$_ner_port" = "853" ]; then
-        if command -v openssl >/dev/null 2>&1 \
-            && openssl s_client -connect "${_ner_ip}:853" \
-                -servername "$_ner_host" -verify_return_error \
-                </dev/null >/dev/null 2>&1; then
+        if ndm_dot_tls_probe "$_ner_host" "$_ner_ip"; then
             logger -t "unblock_dnsmasq" \
                 "NDM probe: host=$_ner_host level=TLS_OK"
             return 0
+        else
+            _ner_probe_rc=$?
         fi
+        case "$_ner_probe_rc" in
+            125|126|127)
+                logger -t "unblock_dnsmasq" \
+                    "NDM probe: host=$_ner_host level=PROBE_UNAVAILABLE rc=$_ner_probe_rc"
+                return 1 ;;
+        esac
         logger -t "unblock_dnsmasq" \
             "NDM probe: host=$_ner_host level=TLS_UNAVAILABLE"
         return 1
@@ -1351,7 +1599,7 @@ ndm_endpoint_reachable() {
     _ner_tls=0
     if [ -n "$_ner_trace" ]; then
         grep -q 'Connected to' "$_ner_trace" 2>/dev/null && _ner_tcp=1
-        grep -qE 'SSL connection using|TLSv[0-9]' \
+        grep -qE 'SSL connection using (TLS|SSL)' \
             "$_ner_trace" 2>/dev/null && _ner_tls=1
     fi
 
@@ -1388,16 +1636,20 @@ ndm_endpoint_reachable() {
         esac
     fi
 
-    if [ "$_ner_tls" -eq 1 ]; then
-        logger -t "unblock_dnsmasq" \
-            "NDM probe: host=$_ner_host level=HTTP_TIMEOUT_AFTER_TLS"
-    elif [ "$_ner_tcp" -eq 1 ]; then
-        logger -t "unblock_dnsmasq" \
-            "NDM probe: host=$_ner_host level=TLS_TIMEOUT_AFTER_TCP"
-    else
-        logger -t "unblock_dnsmasq" \
-            "NDM probe: host=$_ner_host level=TCP_UNAVAILABLE"
-    fi
+    case "$_ner_rc" in
+        51|60) _ner_level=TLS_VERIFY_FAILED ;;
+        35) _ner_level=TLS_HANDSHAKE_FAILED ;;
+        28)
+            if [ "$_ner_tls" -eq 1 ]; then _ner_level=HTTP_TIMEOUT_AFTER_TLS
+            elif [ "$_ner_tcp" -eq 1 ]; then _ner_level=TLS_TIMEOUT_AFTER_TCP
+            else _ner_level=TCP_TIMEOUT; fi
+            ;;
+        6) _ner_level=DNS_RESOLUTION_FAILED ;;
+        7) _ner_level=TCP_CONNECT_FAILED ;;
+        *) _ner_level=TRANSPORT_FAILURE ;;
+    esac
+    logger -t "unblock_dnsmasq" \
+        "NDM probe: host=$_ner_host level=$_ner_level rc=$_ner_rc"
     rm -f "$_ner_trace"
     return 1
 }
@@ -1407,14 +1659,13 @@ ndm_fresh_addresses() {
     # Используется общий порядок local DNSSEC -> tunnel-DNS -> pin ->
     # insecure/40500/provider/bootstrap, а не прямой bootstrap на первом
     # шаге. Старый pin уже доступен через ndm_pinned_lookup.
-    resolve_name_a "$_nfa_host" 2>/dev/null | sort -u
+    resolve_name_a "$_nfa_host" 2>/dev/null | sort -u | head -8
 }
 
 update_ndm_bootstrap_hosts() {
     _unh_body="$(mktemp /tmp/ndm_hosts.XXXXXX 2>/dev/null || true)"
     [ -n "$_unh_body" ] || return 1
     : > "$_unh_body"
-    _unh_incomplete=0
 
     for _unh_host in $NDM_ENDPOINT_HOSTS; do
         _unh_ips="$(ndm_fresh_addresses "$_unh_host")"
@@ -1429,7 +1680,7 @@ update_ndm_bootstrap_hosts() {
                 printf '%s %s\n' "$_unh_ip" "$_unh_host" >> "$_unh_body"
             done
             logger -t "unblock_dnsmasq" \
-                "NDM endpoint refreshed: $_unh_host -> $_unh_ok"
+                "NDM endpoint candidate verified: $_unh_host -> $_unh_ok"
         else
             # При DPI/HTTP 403 не стираем последний рабочий runtime-пин.
             # Старый адрес не объявляется рабочим заново, но сохраняется
@@ -1443,19 +1694,16 @@ update_ndm_bootstrap_hosts() {
                 logger -t "unblock_dnsmasq" \
                     "NDM endpoint preserved: $_unh_host level=PREVIOUS_PIN"
             else
-                _unh_incomplete=1
                 logger -t "unblock_dnsmasq" \
-                    "NDM endpoint not verified: $_unh_host; previous section retained"
+                    "NDM endpoint not verified: $_unh_host; no previous pin, endpoint skipped"
             fi
         fi
     done
 
-    # Never replace a complete verified bootstrap section with an empty or
-    # partial candidate set. This is the same rollback rule as proxy pins.
-    [ "$_unh_incomplete" -eq 0 ] || {
-        rm -f "$_unh_body"
-        return 0
-    }
+    # Commit verified endpoints independently. A missing OPTIONAL endpoint
+    # (OpenNIC in the incident logs) must not discard Google/Quad9/Cloudflare.
+    # Failed endpoints retain their previous pins above; an entirely empty
+    # candidate still leaves the old managed section untouched.
     [ -s "$_unh_body" ] || {
         rm -f "$_unh_body"
         return 0
@@ -1493,6 +1741,7 @@ update_ndm_bootstrap_hosts() {
         return 1
     fi
     rm -f "$_unh_body"
+    logger -t "unblock_dnsmasq" "NDM bootstrap section committed"
 }
 
 # Домен сервера из конфига xray: берём address внутри vnext.
@@ -1633,6 +1882,20 @@ provider_resolver_list() {
 }
 
 resolve_name_a() {
+    if [ "${DNS_POLICY_V4:-0}" = 1 ]; then
+        _v4_name="$1"
+        _v4_a="$(dig -4 +short +time=2 +tries=1 "$_v4_name" A @127.0.0.1 -p 40512 2>/dev/null \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+        if [ -n "$_v4_a" ]; then printf '%s\n' "$_v4_a"; return 0; fi
+        # Only endpoint/pin cold start may use bootstrap outside the facade.
+        bootstrap_host_allowed "$_v4_name" || return 1
+        for _v4_ns in $BOOTSTRAP_RESOLVERS; do
+            _v4_a="$(dig -4 +short +time=2 +tries=1 "$_v4_name" A "@$_v4_ns" 2>/dev/null \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+            if [ -n "$_v4_a" ]; then printf '%s\n' "$_v4_a"; return 0; fi
+        done
+        return 1
+    fi
     _rna_name="$1"
     _rna_out=""
 
@@ -2112,22 +2375,20 @@ update_pinned_hosts
 # dnsmasq must see the newly written /opt/etc/hosts pins before a fallback
 # client is started. Without this reload Hysteria/Xray can still ask the old
 # resolver and fail before its listener appears, recreating the boot loop.
-reload_dnsmasq || true
+reload_dnsmasq hosts || true
 
 # Cold-start bootstrap мог только сейчас записать NDM/Proxy pins.
 # Повторяем выбор tunnel-DNS после их появления, иначе первый запуск
 # остановился бы на DNS_UNAVAILABLE и ждал бы следующего события.
-if [ "$DNS_TUNNEL_READY" -eq 0 ] \
+if [ "${DNS_POLICY_V4:-0}" != 1 ] && [ "$DNS_TUNNEL_READY" -eq 0 ] \
     && { [ -z "$DNS_INITIAL_SECURE_PORTS" ] || [ "$DNS_TUNNEL_REQUIRED" -eq 1 ]; }; then
     if try_tunnel_dns; then
         DNS_TUNNEL_REQUIRED=1
         select_dns_mode
-        update_dnsmasq_upstreams
         logger -t "unblock_dnsmasq" \
             "DNS tunnel activated after pins: protocol=$DNS_TUNNEL_PROTOCOL primary=$DNS_PRIMARY"
     else
         select_dns_mode
-        update_dnsmasq_upstreams
         logger -t "unblock_dnsmasq" \
             "DNS tunnel unavailable after pins: mode=$DNS_MODE"
     fi
@@ -2136,7 +2397,21 @@ fi
 # Pins may make tunnel-DNS available after the first decision. Publish the
 # final post-pin state as the last bounded snapshot record consumed by
 # unblock_ipset.sh; a stale pre-pin DNS_UNAVAILABLE record must not win.
-write_final_dns_snapshot
+select_dns_mode
+update_dnsmasq_upstreams
+refresh_domain_upstreams
+if [ "$DNS_MODE" = DNS_UNAVAILABLE ]; then
+    # Keep the intentionally empty fail-closed upstream selection. Do not
+    # restore a previous direct path when the required tunnel is unavailable.
+    DNS_TX_DONE=1
+    reload_dnsmasq || true
+    publish_dns_failure
+    exit 1
+fi
+if [ "$DNS_HEALTH_ONLY" = "1" ]; then
+    finish_dns_apply || exit 1
+    exit 0
+fi
 
 # Проверяем, есть ли для домена или его родительской зоны уже
 # заданный пользователем server=/zone/... в основном dnsmasq.conf.
@@ -2148,7 +2423,7 @@ dnsmasq_resource_server() {
     awk -v h="$_drs_host" '
         function covered(d) {
             d = tolower(d)
-            return h == d || h ~ ("\\." d "$")
+            return h == d || (length(h)>length(d) && substr(h,length(h)-length(d))=="." d)
         }
         /^[[:space:]]*server=\/[^#]/ {
             line = $0
@@ -2337,5 +2612,5 @@ fi
 
 # Apply the final config only after dynamic interfaces, upstreams, pins and
 # generated resource rules have all been written.
-reload_dnsmasq || exit 1
+finish_dns_apply || exit 1
 exit 0

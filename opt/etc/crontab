@@ -22,3 +22,6 @@ HOME=/
 # Ротация журналов каждые 6 часов: суточного интервала не хватало,
 # если какой-то сервис начинал писать много ошибок подряд.
 30 */6 * * * root /opt/bin/rotate_logs.sh >/dev/null 2>&1
+
+# Hybrid DNS: no minute/five-minute DNS jobs. Pool scans at 11:00 and 23:00
+# run inside the existing controller, in the router's local timezone.

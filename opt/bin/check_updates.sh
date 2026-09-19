@@ -6,8 +6,92 @@ set -eu
 PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 umask 022
 
+# A BusyBox executable does NOT imply that its timeout applet is compiled in.
+# 125 = no usable deadline runner; 124 = deadline; 126/127 = not executed.
+run_bounded() {
+    _rb_seconds="$1"
+    shift
+    if command -v python3 >/dev/null 2>&1; then
+    python3 - "$_rb_seconds" "$@" <<'PY_DEADLINE'
+import os
+import signal
+import subprocess
+import sys
+
+proc = None
+
+def stop_group():
+    if proc is None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+
+def interrupted(sig, frame):
+    raise SystemExit(128 + sig)
+
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, interrupted)
+try:
+    proc = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        rc = proc.wait(timeout=float(sys.argv[1]))
+    except subprocess.TimeoutExpired:
+        rc = 124
+except OSError as exc:
+    rc = 127 if isinstance(exc, FileNotFoundError) else 126
+finally:
+    stop_group()
+sys.exit(rc if rc >= 0 else 128 - rc)
+PY_DEADLINE
+        return $?
+    fi
+    # Early bootstrap may not have Python yet. Require a working kill-after
+    # option rather than trusting either a symlink or a BusyBox version.
+    if command -v timeout >/dev/null 2>&1 \
+        && timeout -k 1 1 /bin/sh -c ':' >/dev/null 2>&1; then
+        timeout -k 1 "$_rb_seconds" "$@"
+        return $?
+    fi
+    if command -v busybox >/dev/null 2>&1 \
+        && busybox timeout -k 1 1 /bin/sh -c ':' >/dev/null 2>&1; then
+        busybox timeout -k 1 "$_rb_seconds" "$@"
+        return $?
+    fi
+    return 125
+}
+
 STATUS_FILE="/tmp/updates_status.json"
-TMP_STATUS="${STATUS_FILE}.tmp"
+TMP_STATUS="${STATUS_FILE}.tmp.$$"
+# Shared by cron, the panel and update_protocols.sh, not just the UI launcher.
+CHECK_LOCK_DIR="${CHECK_LOCK_DIR:-/tmp/keenzoo_versions_worker.lockdir}"
+check_lock_live() {
+    _cl_pid="$(cat "$CHECK_LOCK_DIR/pid" 2>/dev/null || true)"
+    _cl_start="$(cat "$CHECK_LOCK_DIR/start" 2>/dev/null || true)"
+    case "$_cl_pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$_cl_pid" 2>/dev/null || return 1
+    [ -n "$_cl_start" ] && [ "$_cl_start" = "$(awk '{print $22}' "/proc/$_cl_pid/stat" 2>/dev/null)" ]
+}
+if ! mkdir "$CHECK_LOCK_DIR" 2>/dev/null; then
+    check_lock_live && exit 75
+    _cl_age=$(( $(date +%s) - $(stat -c %Y "$CHECK_LOCK_DIR" 2>/dev/null || date +%s) ))
+    [ "$_cl_age" -ge 10 ] || exit 75
+    rm -rf "$CHECK_LOCK_DIR"
+    mkdir "$CHECK_LOCK_DIR" 2>/dev/null || exit 75
+fi
+printf '%s\n' "$$" > "$CHECK_LOCK_DIR/pid"
+awk '{print $22}' "/proc/$$/stat" > "$CHECK_LOCK_DIR/start"
+trap 'rm -f "$TMP_STATUS"; rm -rf "$CHECK_LOCK_DIR"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 BOT_CHAT_ID_FILE="/opt/var/run/bot_chat_id_notify.txt"
 BOT_TOKEN_FILE="/opt/etc/bot/bot_config.py"
 
@@ -49,7 +133,7 @@ ARCH="$(uname -m)"
 cu_is_mips_le() {
     for _cu_c in /bin/busybox /bin/sh /bin/cat; do
         [ -r "$_cu_c" ] || continue
-        _cu_b="$(od -An -tu1 -j5 -N1 "$_cu_c" 2>/dev/null | tr -d ' ')"
+        _cu_b="$(dd if="$_cu_c" bs=1 skip=5 count=1 2>/dev/null | od -b | awk 'NR==1 {print $2+0}')"
         case "$_cu_b" in
             1) return 0 ;;
             2) return 1 ;;
@@ -58,17 +142,18 @@ cu_is_mips_le() {
     grep -qi 'little.endian' /proc/cpuinfo 2>/dev/null && return 0
     grep -qi 'big.endian' /proc/cpuinfo 2>/dev/null && return 1
     # Подавляющее большинство Keenetic на MIPS — little-endian.
-    return 0
+    return 1
 }
 
 case "$ARCH" in
     mips|mipsel|mipsle)
         if cu_is_mips_le; then
             XRAY_GH_OK=1
+            HY_GH_OK=1
         else
             XRAY_GH_OK=0
+            HY_GH_OK=0
         fi
-        HY_GH_OK=1
         ;;
     *)
         XRAY_GH_OK=1
@@ -87,7 +172,7 @@ fi
 dl_json() {
     _url="$1"
     if [ "$DL" = "curl" ]; then
-        curl -s --max-time 15 \
+        curl -4 -fsS --connect-timeout 5 --max-time 15 \
             "$_url" 2>/dev/null
     elif [ "$DL" = "wget" ]; then
         # BusyBox wget понимает только -T SEC, GNU-опция --timeout=
@@ -340,7 +425,10 @@ local_dnsmasq() {
 #  Основная логика
 # ══════════════════════════════════
 
-opkg update >/dev/null 2>&1 || true
+REPO_OK=0
+# Retain cached package lists if no bounded runner or repository is available.
+REPO_PROBE_RC=0
+run_bounded 90 opkg update >/dev/null 2>&1 && REPO_OK=1 || REPO_PROBE_RC=$?
 
 # Текущие
 CUR_XRAY="$(local_xray || true)"
@@ -401,6 +489,20 @@ NEW_DNSMASQ="$(opkg_available "dnsmasq-full" || true)"
 GH_SS="$(github_version_if_binary "$SS_REPO" || true)"
 GH_TROJAN="$(github_version_if_binary "$TROJAN_REPO" || true)"
 GH_TOR="$(github_version_if_binary "$TOR_REPO" || true)"
+
+# A network failure is not "no updates". Keep local versions/cached package
+# information useful but explicitly mark an incomplete remote check.
+CHECK_STATUS="done"
+CHECK_MESSAGE=""
+[ "$REPO_OK" = 1 ] || { CHECK_STATUS=partial; CHECK_MESSAGE=OPKG_UNAVAILABLE; }
+case "$REPO_PROBE_RC" in
+    125|126|127) CHECK_MESSAGE="${CHECK_MESSAGE},OPKG_PROBE_UNAVAILABLE" ;;
+esac
+if { [ "$XRAY_GH_OK" = 1 ] && [ -z "$XRAY_GH" ]; } \
+    || { [ "$HY_GH_OK" = 1 ] && [ -z "$HY_GH" ]; }; then
+    CHECK_STATUS=partial
+    CHECK_MESSAGE="${CHECK_MESSAGE}${CHECK_MESSAGE:+,}GITHUB_UNAVAILABLE"
+fi
 
 # Формируем JSON
 HAS_UPDATES="false"
@@ -466,7 +568,7 @@ gh_note "shadowsocks" "$GH_SS"
 gh_note "trojan" "$GH_TROJAN"
 gh_note "tor" "$GH_TOR"
 
-echo "{\"ts\":${TS},\"has_updates\":${HAS_UPDATES},\"versions\":${VERSIONS},\"updates\":[${UPDATES}],\"github_only\":{${GH_ONLY}},\"arch\":\"${ARCH}\",\"xray_source\":\"${XRAY_SOURCE}\"}" \
+echo "{\"status\":\"${CHECK_STATUS}\",\"message\":\"${CHECK_MESSAGE}\",\"ts\":${TS},\"has_updates\":${HAS_UPDATES},\"versions\":${VERSIONS},\"updates\":[${UPDATES}],\"github_only\":{${GH_ONLY}},\"arch\":\"${ARCH}\",\"xray_source\":\"${XRAY_SOURCE}\"}" \
     > "$TMP_STATUS"
 mv -f "$TMP_STATUS" "$STATUS_FILE"
 

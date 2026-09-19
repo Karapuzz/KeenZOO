@@ -1,4 +1,8 @@
 #!/bin/sh
+# remove keeps data but disables cron/NDM reactivation until next install.
+if [ -f /opt/etc/unblock/.disabled ] && [ "${PURGE_PROJECT:-0}" != 1 ]; then
+    exit 0
+fi
 set -eu
 
 PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
@@ -107,7 +111,10 @@ cleanup() {
         rm -rf "$KEENZOO_LOCK_DIR"
     fi
 }
-trap cleanup EXIT INT TERM HUP
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 trim_comment() {
     printf '%s' "$1" | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//'
@@ -203,7 +210,9 @@ is_public_ipv4() {
             if (o1 == 169 && o2 == 254) { bad = 1; exit }
             if (o1 == 172 && o2 >= 16 && o2 <= 31) { bad = 1; exit }
             if (o1 == 192 && o2 == 168) { bad = 1; exit }
-            if (o1 == 192 && o2 == 0) { bad = 1; exit }
+            if (o1 == 192 && o2 == 0 && ($3 == 0 || $3 == 2)) { bad = 1; exit }
+            if (o1 == 198 && o2 == 51 && $3 == 100) { bad = 1; exit }
+            if (o1 == 203 && o2 == 0 && $3 == 113) { bad = 1; exit }
             if (o1 == 198 && (o2 == 18 || o2 == 19)) { bad = 1; exit }
             if (o1 >= 224) { bad = 1; exit }
         }
@@ -239,6 +248,8 @@ is_public_cidr() {
                 overlap(first,last,2886729728,2887778303) ||
                 overlap(first,last,3221225472,3221225727) ||
                 overlap(first,last,3221225984,3221226239) ||
+                overlap(first,last,3232235520,3232301055) ||
+                overlap(first,last,3323068416,3323199487) ||
                 overlap(first,last,3325256704,3325256959) ||
                 overlap(first,last,3405803776,3405804031) ||
                 overlap(first,last,3758096384,4294967295)) exit 1
@@ -272,6 +283,8 @@ is_public_range() {
                 overlap(first,last,2886729728,2887778303) ||
                 overlap(first,last,3221225472,3221225727) ||
                 overlap(first,last,3221225984,3221226239) ||
+                overlap(first,last,3232235520,3232301055) ||
+                overlap(first,last,3323068416,3323199487) ||
                 overlap(first,last,3325256704,3325256959) ||
                 overlap(first,last,3405803776,3405804031) ||
                 overlap(first,last,3758096384,4294967295)) exit 1
@@ -429,6 +442,15 @@ DNS_TUNNEL_REQUIRED=0
 # unblock_update transaction. The existing bounded health log acts as the
 # short-lived snapshot, avoiding another persistent state file.
 load_dns_snapshot() {
+    # The stable facade remains valid while its internal active resolver
+    # changes. Read the live controller, not yesterday's apply log.
+    if [ -f /opt/etc/bot/utils.py ] && grep -q 'class DNSPolicyV4' /opt/etc/bot/utils.py; then
+        _v4_snapshot="$(python3 /opt/etc/bot/utils.py --dns-shell)" || return 1
+        eval "$_v4_snapshot"
+        [ "$DNS_MODE" != DNS_UNAVAILABLE ] || return 1
+        WORKING_DNS_PORTS="$DNS_WORKING_PORTS"
+        return 0
+    fi
     [ "${KEENZOO_USE_DNS_SNAPSHOT:-0}" = "1" ] || return 1
     [ -f "$DNS_HEALTH_LOG" ] || return 1
     _snp_line="$(grep 'decision=final ' "$DNS_HEALTH_LOG" 2>/dev/null | tail -1 || true)"

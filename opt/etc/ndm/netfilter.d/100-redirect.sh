@@ -1,4 +1,8 @@
 #!/bin/sh
+# remove keeps data but disables cron/NDM reactivation until next install.
+if [ -f /opt/etc/unblock/.disabled ] && [ "${PURGE_PROJECT:-0}" != 1 ]; then
+    exit 0
+fi
 # /opt/etc/ndm/netfilter.d/100-redirect.sh
 # Перехват трафика для списков обхода.
 #   TCP  -> nat/REDIRECT на локальные порты прокси.
@@ -6,6 +10,7 @@
 # Оболочка: BusyBox ash (#!/bin/sh), без bash-измов.
 
 set -eu
+DNS_POLICY_V4=1
 
 PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
@@ -32,7 +37,7 @@ config_words() {
     printf '%s\n' "$_cw_value"
 }
 
-TUNNEL_PROTOCOL_PRIORITY="$(config_words tunnel_protocol_priority 'xray trojan hysteria')"
+TUNNEL_PROTOCOL_PRIORITY="$(config_words tunnel_protocol_priority 'hysteria xray trojan')"
 
 config_string() {
     _cs_key="$1"
@@ -91,6 +96,16 @@ fi
 # service-state reconciliation and therefore does not depend on a service
 # still being enabled or alive. No new daemon/state file is introduced.
 purge_project_netfilter() {
+
+    while $IPT -t nat -D OUTPUT -j KZ_DNS_V4 >/dev/null 2>&1; do :; done
+    $IPT -t nat -F KZ_DNS_V4 >/dev/null 2>&1 || true
+    $IPT -t nat -X KZ_DNS_V4 >/dev/null 2>&1 || true
+    for _v4_mark in 0x2000101 0x2000102 0x2000103; do
+        while $IPT -D OUTPUT -p tcp --dport 53 -m mark --mark "$_v4_mark" -j REJECT >/dev/null 2>&1; do :; done
+    done
+    for _v4_proto in tcp udp; do
+        while $IPT -t nat -D OUTPUT -p "$_v4_proto" --dport 53 -m mark --mark 0x2000104 -j RETURN >/dev/null 2>&1; do :; done
+    done
     _pps_sets="unblocksh unblocktor unblockvless unblocktroj unblockhysteria unblockrouter unblockdns"
     _pps_ports="$PORT_SS:$PORT_TOR:$PORT_VLESS:$PORT_TROJAN:$PORT_HYSTERIA"
 
@@ -141,6 +156,17 @@ purge_project_netfilter() {
             >/dev/null 2>&1; do :; done
     done
 
+    # Dedicated router chain introduced by the protocol selector.
+    while $IPT -t nat -D OUTPUT -p tcp -m set --match-set unblockrouter dst \
+        -j KZ_ROUTER >/dev/null 2>&1; do :; done
+    if $IPT -t nat -S KZ_ROUTER >/dev/null 2>&1; then
+        $IPT -t nat -F KZ_ROUTER >/dev/null 2>&1 || return 1
+        $IPT -t nat -X KZ_ROUTER >/dev/null 2>&1 || return 1
+    fi
+    for _pps_botport in "$PORT_VLESS" "$PORT_TROJAN" "$PORT_HYSTERIA"; do
+        while $IPT -t nat -D OUTPUT -p tcp -m set --match-set unblockrouter dst \
+            -j REDIRECT --to-port "$_pps_botport" >/dev/null 2>&1; do :; done
+    done
     # OUTPUT rules for bot.txt and tunnel-DNS, plus loop/mark exceptions.
     while $IPT -t nat -D OUTPUT -o lo -j RETURN >/dev/null 2>&1; do :; done
     for _pps_net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 \
@@ -280,7 +306,10 @@ if [ "${KEENZOO_UPDATE_LOCK_HELD:-0}" != "1" ]; then
                 _nfl_retry_marker="/tmp/keenzoo.netfilter.retry.${table:-all}"
                 if mkdir "$_nfl_retry_marker" 2>/dev/null; then
                     (
-                        trap 'rm -rf "$_nfl_retry_marker" 2>/dev/null || true' EXIT INT TERM HUP
+                        trap 'rm -rf "$_nfl_retry_marker" 2>/dev/null || true' EXIT
+                        trap 'exit 130' INT
+                        trap 'exit 143' TERM
+                        trap 'exit 129' HUP
                         _nfl_wait=0
                         while [ "$_nfl_wait" -lt 120 ]; do
                             if ! netfilter_lock_owner_live; then
@@ -303,7 +332,10 @@ if [ "${KEENZOO_UPDATE_LOCK_HELD:-0}" != "1" ]; then
     printf '%s\n' "$$" > "$NETFILTER_LOCK_DIR/pid"
     awk '{print $22}' "/proc/$$/stat" 2>/dev/null > "$NETFILTER_LOCK_DIR/start" || true
 fi
-trap netfilter_unlock EXIT INT TERM HUP
+trap netfilter_unlock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # На Keenetic нет logread, а вывод logger в syslog прошивки недоступен
 # обычными средствами. Поэтому диагностика дублируется в файл.
@@ -505,11 +537,13 @@ else
         log_msg "nat snapshot failed"
         exit 1
     }
+    if [ "${DNS_ONLY:-0}" != 1 ]; then
     "$IPT_SAVE_BIN" -t mangle > "$NETFILTER_SNAPSHOT_MANGLE" 2>/dev/null \
         && NETFILTER_SNAPSHOT_MANGLE_READY=1 || {
         log_msg "mangle snapshot failed"
         exit 1
     }
+    fi
 fi
 
 netfilter_exit() {
@@ -537,7 +571,10 @@ netfilter_exit() {
     netfilter_unlock
     exit "$_nfe_rc"
 }
-trap netfilter_exit EXIT INT TERM HUP
+trap netfilter_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # PURGE_PROJECT is handled after the matching iptables binaries and shared
 # lock are ready. Seed the same runtime constants under `set -u`; normal
@@ -555,7 +592,7 @@ TPROXY_RULE_PRIO="${TPROXY_RULE_PRIO:-1770}"
 XRAY_MARK="${XRAY_MARK:-0x2000000}"
 LAN_IFACE_PATTERNS="${LAN_IFACE_PATTERNS:-br0 br1 br2 wlan0 wlan1 wlan2 wlan3 nwg0 nwg1 nwg2 wg0 wg1 tun0 tap0 ppp-l2tp0 sstp0}"
 LAN_IFACES="${LAN_IFACES:-$LAN_IFACE_PATTERNS}"
-local_ip="${local_ip:-${CONFIG_ROUTER_IP:-}}"
+local_ip="${local_ip:-${CONFIG_ROUTER_IP:-$(config_string routerip 192.168.1.1)}}"
 if [ "${PURGE_PROJECT:-0}" = "1" ]; then
     purge_project_netfilter
     exit 0
@@ -604,6 +641,248 @@ case "$DNS_SNAPSHOT_MAX_AGE" in
     ''|*[!0-9]*) DNS_SNAPSHOT_MAX_AGE=90000 ;;
 esac
 
+# DNS-only refresh uses the SAME DNS helpers as a normal NDM event, but
+# does not rebuild LAN, TPROXY or WireGuard rules (nor their routing tables).
+INIT_VLESS="/opt/etc/init.d/S24xray"
+INIT_TROJ="/opt/etc/init.d/S22trojan"
+INIT_HY="/opt/etc/init.d/S57hysteria"
+svc_enabled() {
+    _init="$1"
+    [ -f "$_init" ] || return 1
+    if grep -qE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*no' \
+        "$_init" 2>/dev/null
+    then
+        return 1
+    fi
+
+    # Мало того, что сервис разрешён — он должен реально работать.
+    # Правило на упавший сервис создаёт чёрную дыру: пакеты уходят на
+    # порт, который никто не слушает, и клиент получает таймаут вместо
+    # обхода (наблюдалось с hysteria: сервис dead, а 6 правил на
+    # unblockhysteria стояли). Порт берётся из PROCS init-скрипта.
+    _svc_proc="$(sed -n \
+        's/^[[:space:]]*PROCS[[:space:]]*=[[:space:]]*\([^[:space:]#]*\).*/\1/p' \
+        "$_init" 2>/dev/null | head -1)"
+    [ -n "$_svc_proc" ] || return 1
+
+    # Разбор /proc, без pgrep: он есть не во всех сборках BusyBox.
+    # Сравнивается ИМЯ БИНАРНИКА (argv[0]), а не вся командная строка:
+    # подстрочный поиск принимал за живой сервис любой процесс, где имя
+    # встречается в аргументах — например "vi /opt/etc/hysteria/config.json"
+    # или "tail -f .../hysteria.log". Тогда правила создавались для
+    # мёртвого сервиса, то есть ровно та ошибка, ради которой делалась
+    # проверка.
+    # Результат кэшируется на время прогона: функция вызывается до 15 раз
+    # (5 сервисов × 3 интерфейса), и каждый раз обходить весь /proc
+    # слишком дорого — прошивка убивала хук по таймауту
+    # ("100-redirect.sh: timed out", Opkg::Manager).
+    # Имя процесса нормализуется: в имени переменной допустимы только
+    # [A-Za-z0-9_], а PROCS бывает вида "ss-redir".
+    _svc_key="$(printf '%s' "$_svc_proc" | tr -c 'A-Za-z0-9_' '_')"
+    eval "_svc_cached=\"\${_SVC_ALIVE_${_svc_key}:-}\""
+    case "$_svc_cached" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+
+    _svc_found=1
+    for _svc_d in /proc/[0-9]*; do
+        # Процесс мог завершиться между раскрытием маски и чтением файла.
+        # Перенаправление "< файл" выполняет ОБОЛОЧКА, и её сообщение
+        # "can't open ...: no such file" не подавляется через 2>/dev/null
+        # у самой команды — в журнале роутера это выглядело как ошибка
+        # скрипта. Читаем через cat с подавлением его собственного stderr.
+        _svc_argv0="$(cat "$_svc_d/cmdline" 2>/dev/null \
+            | tr '\0' '\n' | head -1)"
+        [ -n "$_svc_argv0" ] || continue
+        # argv[0] может быть как "hysteria", так и "/opt/bin/hysteria".
+        if [ "${_svc_argv0##*/}" = "$_svc_proc" ]; then
+            _svc_found=0
+            break
+        fi
+    done
+
+    # Имя процесса подставляется в имя переменной, поэтому из него
+    # убирается всё, кроме [A-Za-z0-9_]: "ss-redir" дал бы недопустимое
+    # имя и eval завершился бы ошибкой.
+    _svc_key="$(printf '%s' "$_svc_proc" | tr -c 'A-Za-z0-9_' '_')"
+    if [ "$_svc_found" = "0" ]; then
+        eval "_SVC_ALIVE_${_svc_key}=1"
+        return 0
+    fi
+
+    eval "_SVC_ALIVE_${_svc_key}=0"
+    log_msg "$_svc_proc не запущен — правила перехвата не создаются"
+    return 1
+}
+
+dns_snapshot_tunnel() {
+    [ -f "$DNS_HEALTH_LOG" ] || return 1
+    _dst_line="$(grep 'decision=final ' "$DNS_HEALTH_LOG" 2>/dev/null | tail -1 || true)"
+    [ -n "$_dst_line" ] || return 1
+    _dst_epoch="$(printf '%s\n' "$_dst_line" | sed -n 's/.* epoch=\([0-9][0-9]*\) .*/\1/p')"
+    case "$_dst_epoch" in ''|*[!0-9]*) return 1 ;; esac
+    _dst_now="$(date +%s 2>/dev/null || echo 0)"
+    [ "$_dst_now" -ge "$_dst_epoch" ] || return 1
+    [ $((_dst_now - _dst_epoch)) -le "$DNS_SNAPSHOT_MAX_AGE" ] || return 1
+    _dst_mode="$(printf '%s\n' "$_dst_line" | sed -n 's/.* mode=\([^ ]*\).*/\1/p')"
+    _dst_level="$(printf '%s\n' "$_dst_line" | sed -n 's/.* level=\([^ ]*\).*/\1/p')"
+    _dst_required="$(printf '%s\n' "$_dst_line" | sed -n 's/.* required=\([^ ]*\).*/\1/p')"
+    _dst_verified="$(printf '%s\n' "$_dst_line" | sed -n 's/.* verified=\([^ ]*\).*/\1/p')"
+    _dst_tunnel="$(printf '%s\n' "$_dst_line" | sed -n 's/.* tunnel=\([^ ]*\).*/\1/p')"
+    [ "$_dst_mode" = "TUNNEL_DNS" ] \
+        && [ "$_dst_level" = "TUNNEL_DNS" ] \
+        && [ "$_dst_required" = "1" ] \
+        && [ "$_dst_verified" = "1" ] || return 1
+    case "$_dst_tunnel" in
+        xray) svc_enabled "$INIT_VLESS" || return 1; printf '%s\n' "$PORT_VLESS" ;;
+        trojan) svc_enabled "$INIT_TROJ" || return 1; printf '%s\n' "$PORT_TROJAN" ;;
+        hysteria) svc_enabled "$INIT_HY" || return 1; printf '%s\n' "$PORT_HYSTERIA" ;;
+        *) return 1 ;;
+    esac
+}
+
+# v4: only sockets explicitly marked by the DNS controller use tunnel DNS.
+# The mandatory filter guard prevents a missing NAT rule from leaking a
+# tunnel probe/query as direct TCP53. Normal DoT/DoH listeners are not routed
+# through a tunnel merely because a proxy daemon is running.
+apply_dns_v4_filter() {
+    for _v4_mark in 0x2000101 0x2000102 0x2000103; do
+        if ! $IPT -C OUTPUT -p tcp --dport 53 -m mark --mark "$_v4_mark" -j REJECT >/dev/null 2>&1; then
+            $IPT -I OUTPUT 1 -p tcp --dport 53 -m mark --mark "$_v4_mark" -j REJECT || return 1
+        fi
+    done
+}
+
+apply_dns_v4_nat() {
+    $IPT -t nat -N KZ_DNS_V4 >/dev/null 2>&1 || true
+    # Build guards in filter BEFORE installing any marked redirect.
+    apply_dns_v4_filter || return 1
+    # No flushing of a live chain: replacing a target leaves no direct gap.
+    for _v4_spec in "0x2000101:$PORT_HYSTERIA" "0x2000102:$PORT_VLESS" "0x2000103:$PORT_TROJAN"; do
+        _v4_mark="${_v4_spec%%:*}"; _v4_port="${_v4_spec#*:}"
+        if ! $IPT -t nat -C KZ_DNS_V4 -p tcp --dport 53 -m mark --mark "$_v4_mark" -j REDIRECT --to-ports "$_v4_port" >/dev/null 2>&1; then
+            $IPT -t nat -I KZ_DNS_V4 1 -p tcp --dport 53 -m mark --mark "$_v4_mark" -j REDIRECT --to-ports "$_v4_port" || return 1
+        fi
+    done
+    # Emergency sockets explicitly bypass project-wide router TCP redirect.
+    for _v4_proto in tcp udp; do
+        if ! $IPT -t nat -C OUTPUT -p "$_v4_proto" --dport 53 -m mark --mark 0x2000104 -j RETURN >/dev/null 2>&1; then
+            $IPT -t nat -I OUTPUT 1 -p "$_v4_proto" --dport 53 -m mark --mark 0x2000104 -j RETURN || return 1
+        fi
+    done
+    # Put the policy chain before generic mark/loopback/router RETURN rules.
+    while $IPT -t nat -D OUTPUT -j KZ_DNS_V4 >/dev/null 2>&1; do :; done
+    $IPT -t nat -I OUTPUT 1 -j KZ_DNS_V4 || return 1
+}
+
+apply_dns_filter() {
+    # When tunnel DNS is verified, raw external DNS (including user-owned
+    # server=/zone/<public-ip> rules) is fail-closed. System DoH/DoT uses
+    # TCP/443 or TCP/853 and is redirected separately through the tunnel.
+    for _raw_proto in tcp udp; do
+        while $IPT -D OUTPUT -d 127.0.0.0/8 -p "$_raw_proto" --dport 53 \
+            -j RETURN >/dev/null 2>&1; do :; done
+        while $IPT -D OUTPUT -p "$_raw_proto" --dport 53 \
+            -j DROP >/dev/null 2>&1; do :; done
+    done
+    _raw_block="${DNS_TUNNEL_BLOCK_RAW_DNS:-}"
+    if [ -z "$_raw_block" ]; then
+        _raw_block=0
+        if [ "${DNS_TUNNEL_DISABLE:-0}" != 1 ] && dns_snapshot_tunnel >/dev/null; then
+            _raw_block=1
+        fi
+    fi
+    [ "${DNS_POLICY_V4:-0}" != 1 ] || _raw_block=0
+    if [ "$_raw_block" = "1" ]; then
+        for _raw_proto in tcp udp; do
+            $IPT -I OUTPUT -d 127.0.0.0/8 -p "$_raw_proto" --dport 53 \
+                -j RETURN >/dev/null 2>&1 || exit 1
+            $IPT -A OUTPUT -p "$_raw_proto" --dport 53 \
+                -j DROP >/dev/null 2>&1 || exit 1
+        done
+    fi
+
+    if [ "${DNS_POLICY_V4:-0}" = 1 ]; then apply_dns_v4_filter || return 1; fi
+
+}
+
+apply_dns_nat() {
+    # Required even on a cold start before the full hook has run.
+    for _dn_rule in lo mark; do
+        case "$_dn_rule" in
+            lo) set -- -o lo ;;
+            mark) set -- -m mark --mark "$XRAY_MARK" ;;
+        esac
+        if ! $IPT -t nat -C OUTPUT "$@" -j RETURN >/dev/null 2>&1; then
+            $IPT -t nat -I OUTPUT "$@" -j RETURN >/dev/null 2>&1 || return 1
+        fi
+    done
+[ "${DNS_POLICY_V4:-0}" != 1 ] || DNS_TUNNEL_DISABLE=1
+DNS_TUNNEL_VERIFIED="${DNS_TUNNEL_VERIFIED:-0}"
+DNS_TUNNEL_PORT=""
+if [ "${DNS_TUNNEL_DISABLE:-0}" != "1" ]; then
+    _dns_snapshot_port="$(dns_snapshot_tunnel || true)"
+    case "${DNS_TUNNEL_PROTOCOL:-}" in
+        xray)
+            if [ "$DNS_TUNNEL_VERIFIED" = "1" ] \
+                && svc_enabled "$INIT_VLESS"; then
+                DNS_TUNNEL_PORT="$PORT_VLESS"
+            fi
+            ;;
+        trojan)
+            if [ "$DNS_TUNNEL_VERIFIED" = "1" ] \
+                && svc_enabled "$INIT_TROJ"; then
+                DNS_TUNNEL_PORT="$PORT_TROJAN"
+            fi
+            ;;
+        hysteria)
+            if [ "$DNS_TUNNEL_VERIFIED" = "1" ] \
+                && svc_enabled "$INIT_HY"; then
+                DNS_TUNNEL_PORT="$PORT_HYSTERIA"
+            fi
+            ;;
+        '') DNS_TUNNEL_PORT="$_dns_snapshot_port" ;;
+        *) log_msg "invalid DNS_TUNNEL_PROTOCOL; DNS redirect disabled" ;;
+    esac
+fi
+
+# Снять старые варианты, включая прежнее правило без --dport.
+for _dns_tunnel_port in "$PORT_VLESS" "$PORT_TROJAN" "$PORT_HYSTERIA"; do
+    for _dns_remote_port in 443 853; do
+        while $IPT -t nat -D OUTPUT -p tcp --dport "$_dns_remote_port" \
+            -m set --match-set unblockdns dst \
+            -j REDIRECT --to-port "$_dns_tunnel_port" >/dev/null 2>&1; do :; done
+    done
+    while $IPT -t nat -D OUTPUT -p tcp \
+        -m set --match-set unblockdns dst \
+        -j REDIRECT --to-port "$_dns_tunnel_port" >/dev/null 2>&1; do :; done
+done
+
+if [ -n "$DNS_TUNNEL_PORT" ]; then
+    for _dns_remote_port in 443 853; do
+        if ! $IPT -t nat -C OUTPUT -p tcp --dport "$_dns_remote_port" \
+            -m set --match-set unblockdns dst \
+            -j REDIRECT --to-port "$DNS_TUNNEL_PORT" >/dev/null 2>&1; then
+            $IPT -t nat -A OUTPUT -p tcp --dport "$_dns_remote_port" \
+                -m set --match-set unblockdns dst \
+                -j REDIRECT --to-port "$DNS_TUNNEL_PORT" >/dev/null 2>&1 || exit 1
+        fi
+    done
+fi
+    if [ "${DNS_POLICY_V4:-0}" = 1 ]; then apply_dns_v4_nat || return 1; fi
+    return 0
+}
+
+if [ "${DNS_ONLY:-0}" = 1 ]; then
+    case "${table:-}" in
+        nat) apply_dns_nat ;;
+        filter) apply_dns_filter ;;
+        *) log_msg "DNS_ONLY requires nat or filter"; exit 1 ;;
+    esac
+    exit 0
+fi
+
 # ── TPROXY: отдельная метка и таблица маршрутизации ──────────────────────
 # Маска гарантирует отсутствие пересечения с VPN-метками вида 0xd1001.
 # Метка вынесена в старший бит (0x1000000). VPN-марки формируются как
@@ -629,18 +908,20 @@ LAN_IFACE_PATTERNS="br0 br1 br2 wlan0 wlan1 wlan2 wlan3 nwg0 nwg1 nwg2 wg0 wg1 t
 
 lan_ifaces() {
     _li_out=""
+    _li_links="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
+        | sed 's/@.*//' | tr '\n' ' ')"
     # Prefer the deploy-time configuration when it exists. The parser is
     # intentionally limited to a simple Python list of interface names.
     for _li_if in $(sed -n \
         "s/^[[:space:]]*lan_ifaces[[:space:]]*=[[:space:]]*\\[\\(.*\\)\\]/\\1/p" \
         /opt/etc/bot/bot_config.py 2>/dev/null \
         | tr -d "'\"" | tr ',' ' '); do
-        if ip link show "$_li_if" >/dev/null 2>&1; then
+        if printf '%s\n' "$_li_links" | tr ' ' '\n' | grep -Fxq "$_li_if"; then
             _li_out="${_li_out}${_li_out:+ }${_li_if}"
         fi
     done
     for _li_if in $LAN_IFACE_PATTERNS; do
-        if ip link show "$_li_if" >/dev/null 2>&1; then
+        if printf '%s\n' "$_li_links" | tr ' ' '\n' | grep -Fxq "$_li_if"; then
             case " $_li_out " in
                 *" $_li_if "*) ;;
                 *) _li_out="${_li_out}${_li_out:+ }${_li_if}" ;;
@@ -711,23 +992,7 @@ fi
 # Разрешение выдаётся по loopback и фактическим внутренним интерфейсам.
 # Это закрывает WAN spoofing даже при RFC1918 source address.
 if [ "${table:-}" = "filter" ]; then
-    # When tunnel DNS is verified, raw external DNS (including user-owned
-    # server=/zone/<public-ip> rules) is fail-closed. System DoH/DoT uses
-    # TCP/443 or TCP/853 and is redirected separately through the tunnel.
-    for _raw_proto in tcp udp; do
-        while $IPT -D OUTPUT -d 127.0.0.0/8 -p "$_raw_proto" --dport 53 \
-            -j RETURN >/dev/null 2>&1; do :; done
-        while $IPT -D OUTPUT -p "$_raw_proto" --dport 53 \
-            -j DROP >/dev/null 2>&1; do :; done
-    done
-    if [ "${DNS_TUNNEL_BLOCK_RAW_DNS:-0}" = "1" ]; then
-        for _raw_proto in tcp udp; do
-            $IPT -I OUTPUT -d 127.0.0.0/8 -p "$_raw_proto" --dport 53 \
-                -j RETURN >/dev/null 2>&1 || exit 1
-            $IPT -A OUTPUT -p "$_raw_proto" --dport 53 \
-                -j DROP >/dev/null 2>&1 || exit 1
-        done
-    fi
+    apply_dns_filter
 
     # Remove legacy source-only accepts. A private source address arriving
     # from WAN is not a trustworthy LAN identity.
@@ -863,75 +1128,7 @@ ensure_set() {
 # ENABLED=no (ползунок в веб-панели). Для такого протокола правила
 # перехвата не создаются, а ранее созданные снимаются — иначе трафик
 # уходил бы на порт остановленного сервиса и соединение просто рвалось.
-svc_enabled() {
-    _init="$1"
-    [ -f "$_init" ] || return 0
-    if grep -qE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*no' \
-        "$_init" 2>/dev/null
-    then
-        return 1
-    fi
 
-    # Мало того, что сервис разрешён — он должен реально работать.
-    # Правило на упавший сервис создаёт чёрную дыру: пакеты уходят на
-    # порт, который никто не слушает, и клиент получает таймаут вместо
-    # обхода (наблюдалось с hysteria: сервис dead, а 6 правил на
-    # unblockhysteria стояли). Порт берётся из PROCS init-скрипта.
-    _svc_proc="$(sed -n \
-        's/^[[:space:]]*PROCS[[:space:]]*=[[:space:]]*\([^[:space:]#]*\).*/\1/p' \
-        "$_init" 2>/dev/null | head -1)"
-    [ -n "$_svc_proc" ] || return 0
-
-    # Разбор /proc, без pgrep: он есть не во всех сборках BusyBox.
-    # Сравнивается ИМЯ БИНАРНИКА (argv[0]), а не вся командная строка:
-    # подстрочный поиск принимал за живой сервис любой процесс, где имя
-    # встречается в аргументах — например "vi /opt/etc/hysteria/config.json"
-    # или "tail -f .../hysteria.log". Тогда правила создавались для
-    # мёртвого сервиса, то есть ровно та ошибка, ради которой делалась
-    # проверка.
-    # Результат кэшируется на время прогона: функция вызывается до 15 раз
-    # (5 сервисов × 3 интерфейса), и каждый раз обходить весь /proc
-    # слишком дорого — прошивка убивала хук по таймауту
-    # ("100-redirect.sh: timed out", Opkg::Manager).
-    # Имя процесса нормализуется: в имени переменной допустимы только
-    # [A-Za-z0-9_], а PROCS бывает вида "ss-redir".
-    _svc_key="$(printf '%s' "$_svc_proc" | tr -c 'A-Za-z0-9_' '_')"
-    eval "_svc_cached=\"\${_SVC_ALIVE_${_svc_key}:-}\""
-    case "$_svc_cached" in
-        1) return 0 ;;
-        0) return 1 ;;
-    esac
-
-    _svc_found=1
-    for _svc_d in /proc/[0-9]*; do
-        # Процесс мог завершиться между раскрытием маски и чтением файла.
-        # Перенаправление "< файл" выполняет ОБОЛОЧКА, и её сообщение
-        # "can't open ...: no such file" не подавляется через 2>/dev/null
-        # у самой команды — в журнале роутера это выглядело как ошибка
-        # скрипта. Читаем через cat с подавлением его собственного stderr.
-        _svc_argv0="$(cat "$_svc_d/cmdline" 2>/dev/null \
-            | tr '\0' '\n' | head -1)"
-        [ -n "$_svc_argv0" ] || continue
-        # argv[0] может быть как "hysteria", так и "/opt/bin/hysteria".
-        if [ "${_svc_argv0##*/}" = "$_svc_proc" ]; then
-            _svc_found=0
-            break
-        fi
-    done
-
-    # Имя процесса подставляется в имя переменной, поэтому из него
-    # убирается всё, кроме [A-Za-z0-9_]: "ss-redir" дал бы недопустимое
-    # имя и eval завершился бы ошибкой.
-    _svc_key="$(printf '%s' "$_svc_proc" | tr -c 'A-Za-z0-9_' '_')"
-    if [ "$_svc_found" = "0" ]; then
-        eval "_SVC_ALIVE_${_svc_key}=1"
-        return 0
-    fi
-
-    eval "_SVC_ALIVE_${_svc_key}=0"
-    log_msg "$_svc_proc не запущен — правила перехвата не создаются"
-    return 1
-}
 
 # Снимает правило REDIRECT с конкретного интерфейса.
 nat_del_prerouting() {
@@ -1303,107 +1500,65 @@ fi
 # существующего bounded health log; поиск «первого живого процесса» здесь
 # запрещён, иначе fallback Xray -> Trojan -> Hysteria расходился бы с DNS
 # health и мог вернуть stale unblockdns к другому tunnel.
-dns_snapshot_tunnel() {
-    [ -f "$DNS_HEALTH_LOG" ] || return 1
-    _dst_line="$(grep 'decision=final ' "$DNS_HEALTH_LOG" 2>/dev/null | tail -1 || true)"
-    [ -n "$_dst_line" ] || return 1
-    _dst_epoch="$(printf '%s\n' "$_dst_line" | sed -n 's/.* epoch=\([0-9][0-9]*\) .*/\1/p')"
-    case "$_dst_epoch" in ''|*[!0-9]*) return 1 ;; esac
-    _dst_now="$(date +%s 2>/dev/null || echo 0)"
-    [ "$_dst_now" -ge "$_dst_epoch" ] || return 1
-    [ $((_dst_now - _dst_epoch)) -le "$DNS_SNAPSHOT_MAX_AGE" ] || return 1
-    _dst_mode="$(printf '%s\n' "$_dst_line" | sed -n 's/.* mode=\([^ ]*\).*/\1/p')"
-    _dst_level="$(printf '%s\n' "$_dst_line" | sed -n 's/.* level=\([^ ]*\).*/\1/p')"
-    _dst_required="$(printf '%s\n' "$_dst_line" | sed -n 's/.* required=\([^ ]*\).*/\1/p')"
-    _dst_verified="$(printf '%s\n' "$_dst_line" | sed -n 's/.* verified=\([^ ]*\).*/\1/p')"
-    _dst_tunnel="$(printf '%s\n' "$_dst_line" | sed -n 's/.* tunnel=\([^ ]*\).*/\1/p')"
-    [ "$_dst_mode" = "TUNNEL_DNS" ] \
-        && [ "$_dst_level" = "TUNNEL_DNS" ] \
-        && [ "$_dst_required" = "1" ] \
-        && [ "$_dst_verified" = "1" ] || return 1
-    case "$_dst_tunnel" in
-        xray) svc_enabled "$INIT_VLESS" || return 1; printf '%s\n' "$PORT_VLESS" ;;
-        trojan) svc_enabled "$INIT_TROJ" || return 1; printf '%s\n' "$PORT_TROJAN" ;;
-        hysteria) svc_enabled "$INIT_HY" || return 1; printf '%s\n' "$PORT_HYSTERIA" ;;
-        *) return 1 ;;
-    esac
+
+
+apply_dns_nat
+
+# TCP router path: selection is a single data word, NEVER sourced as shell.
+router_protocol() {
+    _rp_file=/opt/etc/unblock/.router_protocol
+    _rp=xray
+    if [ -f "$_rp_file" ]; then
+        IFS= read -r _rp < "$_rp_file" || [ -n "$_rp" ] || return 1
+    fi
+    case "$_rp" in xray|trojan|hysteria) printf '%s\n' "$_rp" ;; *) return 1 ;; esac
 }
 
-DNS_TUNNEL_VERIFIED="${DNS_TUNNEL_VERIFIED:-0}"
-DNS_TUNNEL_PORT=""
-if [ "${DNS_TUNNEL_DISABLE:-0}" != "1" ]; then
-    _dns_snapshot_port="$(dns_snapshot_tunnel || true)"
-    case "${DNS_TUNNEL_PROTOCOL:-}" in
-        xray)
-            if [ "$DNS_TUNNEL_VERIFIED" = "1" ] \
-                && svc_enabled "$INIT_VLESS"; then
-                DNS_TUNNEL_PORT="$PORT_VLESS"
-            fi
-            ;;
-        trojan)
-            if [ "$DNS_TUNNEL_VERIFIED" = "1" ] \
-                && svc_enabled "$INIT_TROJ"; then
-                DNS_TUNNEL_PORT="$PORT_TROJAN"
-            fi
-            ;;
-        hysteria)
-            if [ "$DNS_TUNNEL_VERIFIED" = "1" ] \
-                && svc_enabled "$INIT_HY"; then
-                DNS_TUNNEL_PORT="$PORT_HYSTERIA"
-            fi
-            ;;
-        '') DNS_TUNNEL_PORT="$_dns_snapshot_port" ;;
-        *) log_msg "invalid DNS_TUNNEL_PROTOCOL; DNS redirect disabled" ;;
+apply_router_tcp() {
+    _rt_proto="$(router_protocol)" || { log_msg "invalid router protocol"; return 1; }
+    case "$_rt_proto" in
+        xray) _rt_init="$INIT_VLESS"; _rt_port="$PORT_VLESS" ;;
+        trojan) _rt_init="$INIT_TROJ"; _rt_port="$PORT_TROJAN" ;;
+        hysteria) _rt_init="$INIT_HY"; _rt_port="$PORT_HYSTERIA" ;;
     esac
-fi
-
-# Снять старые варианты, включая прежнее правило без --dport.
-for _dns_tunnel_port in "$PORT_VLESS" "$PORT_TROJAN" "$PORT_HYSTERIA"; do
-    for _dns_remote_port in 443 853; do
-        while $IPT -t nat -D OUTPUT -p tcp --dport "$_dns_remote_port" \
-            -m set --match-set unblockdns dst \
-            -j REDIRECT --to-port "$_dns_tunnel_port" >/dev/null 2>&1; do :; done
-    done
-    while $IPT -t nat -D OUTPUT -p tcp \
-        -m set --match-set unblockdns dst \
-        -j REDIRECT --to-port "$_dns_tunnel_port" >/dev/null 2>&1; do :; done
-done
-
-if [ -n "$DNS_TUNNEL_PORT" ]; then
-    for _dns_remote_port in 443 853; do
-        if ! $IPT -t nat -C OUTPUT -p tcp --dport "$_dns_remote_port" \
-            -m set --match-set unblockdns dst \
-            -j REDIRECT --to-port "$DNS_TUNNEL_PORT" >/dev/null 2>&1; then
-            $IPT -t nat -A OUTPUT -p tcp --dport "$_dns_remote_port" \
-                -m set --match-set unblockdns dst \
-                -j REDIRECT --to-port "$DNS_TUNNEL_PORT" >/dev/null 2>&1 || exit 1
-        fi
-    done
-fi
-
-# TCP роутера (bot.txt) -> xray/VLESS через nat/REDIRECT.
-# Если VLESS отключён ползунком, правило снимается: иначе трафик самого
-# роутера (в т.ч. бота к api.telegram.org) уходил бы на мёртвый порт.
-if svc_enabled "$INIT_VLESS"; then
-    if ! $IPT -t nat -C OUTPUT -p tcp \
-        -m set --match-set unblockrouter dst \
-        -j REDIRECT --to-port "$PORT_VLESS" >/dev/null 2>&1
-    then
-        $IPT -t nat -A OUTPUT -p tcp \
-            -m set --match-set unblockrouter dst \
-            -j REDIRECT --to-port "$PORT_VLESS" >/dev/null 2>&1 || exit 1
+    # Small dedicated chain: do not flush OUTPUT or any Keenetic/WireGuard chain.
+    if ! $IPT -t nat -S KZ_ROUTER >/dev/null 2>&1; then
+        $IPT -t nat -N KZ_ROUTER >/dev/null 2>&1 || return 1
     fi
-else
-    while $IPT -t nat -D OUTPUT -p tcp \
-        -m set --match-set unblockrouter dst \
-        -j REDIRECT --to-port "$PORT_VLESS" >/dev/null 2>&1
-    do
-        :
+    $IPT -t nat -F KZ_ROUTER >/dev/null 2>&1 || return 1
+    # Remove legacy redirects and the old jump; reinstall exactly once.
+    while $IPT -t nat -D OUTPUT -p tcp -m set --match-set unblockrouter dst \
+        -j KZ_ROUTER >/dev/null 2>&1; do :; done
+    for _rt_old in "$PORT_VLESS" "$PORT_TROJAN" "$PORT_HYSTERIA"; do
+        while $IPT -t nat -D OUTPUT -p tcp -m set --match-set unblockrouter dst \
+            -j REDIRECT --to-port "$_rt_old" >/dev/null 2>&1; do :; done
     done
-fi
+    svc_enabled "$_rt_init" || return 0
 
-# UDP роутера ранее уходил в ss-redir (PORT_SS) — это противоречило
-# требованию "bot.txt только через xray". Снимаем такое правило.
+    # Trojan has no Xray sockopt mark. Bypass its upstream to prevent a loop
+    # if a broad bot.txt CIDR contains the VPS. Domain endpoints require the
+    # existing managed pins; no new DNS requests in a short NDM hook.
+    if [ "$_rt_proto" = trojan ]; then
+        _rt_host="$(sed -n 's/.*"remote_addr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /opt/etc/trojan/config.json | head -n1)"
+        _rt_ips="$(printf '%s\n' "$_rt_host" | awk -F. '
+            NF==4 {ok=1; for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || $i>255) ok=0; if(ok) print}')"
+        if [ -z "$_rt_ips" ]; then
+            _rt_ips="$(awk -v h="$_rt_host" '
+                /^# --- KeenZOO pinned / {inside=1; next}
+                /^# --- end KeenZOO pinned/ {inside=0}
+                inside && $1 !~ /^#/ {for(i=2;i<=NF;i++) if($i==h) print $1}
+            ' /opt/etc/hosts 2>/dev/null || true)"
+        fi
+        [ -n "$_rt_ips" ] || { log_msg "Trojan router path: missing IPv4 endpoint pin"; return 1; }
+        for _rt_ip in $_rt_ips; do
+            $IPT -t nat -A KZ_ROUTER -d "$_rt_ip" -j RETURN >/dev/null 2>&1 || return 1
+        done
+    fi
+    $IPT -t nat -A KZ_ROUTER -p tcp -j REDIRECT --to-port "$_rt_port" >/dev/null 2>&1 || return 1
+    $IPT -t nat -A OUTPUT -p tcp -m set --match-set unblockrouter dst \
+        -j KZ_ROUTER >/dev/null 2>&1 || return 1
+}
+apply_router_tcp || exit 1
 
 # Local-origin UDP is deliberately not intercepted. Linux local packets
 # traverse OUTPUT -> POSTROUTING, not PREROUTING; marking OUTPUT and hoping

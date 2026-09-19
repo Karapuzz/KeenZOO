@@ -24,7 +24,15 @@ HY_GPG_SIG_URL="${HY_GPG_SIG_URL:-}"
 # permanent script. PID plus /proc starttime avoids PID reuse.
 PROTO_LOCK_DIR="${PROTO_LOCK_DIR:-/tmp/keenzoo_protocol_update.lockdir}"
 PROTO_LOCK_ACQUIRED=0
+OPKG_INIT_STAGE=""
 proto_lock_live() {
+    if [ ! -f "$PROTO_LOCK_DIR/pid" ]; then
+        _pl_mtime="$(stat -c %Y "$PROTO_LOCK_DIR" 2>/dev/null || echo 0)"
+        _pl_now="$(date +%s 2>/dev/null || echo 0)"
+        case "$_pl_mtime:$_pl_now" in *[!0-9:]*|0:*) return 1 ;; esac
+        [ $((_pl_now - _pl_mtime)) -lt 10 ] && return 0
+        return 1
+    fi
     _pl_pid="$(cat "$PROTO_LOCK_DIR/pid" 2>/dev/null || true)"
     _pl_saved="$(cat "$PROTO_LOCK_DIR/start" 2>/dev/null || true)"
     case "$_pl_pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -36,6 +44,9 @@ proto_lock_live() {
     return 0
 }
 proto_unlock() {
+    if [ -n "$OPKG_INIT_STAGE" ]; then
+        restore_package_inits || true
+    fi
     [ "$PROTO_LOCK_ACQUIRED" -eq 1 ] && rm -rf "$PROTO_LOCK_DIR"
 }
 _pl_tries=0
@@ -51,7 +62,10 @@ done
 PROTO_LOCK_ACQUIRED=1
 printf '%s\n' "$$" > "$PROTO_LOCK_DIR/pid"
 awk '{print $22}' "/proc/$$/stat" 2>/dev/null > "$PROTO_LOCK_DIR/start" || true
-trap proto_unlock EXIT INT TERM HUP
+trap proto_unlock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 have_cmd() {
     command -v "$1" >/dev/null 2>&1
@@ -147,7 +161,7 @@ wait_service_ready() {
 up_is_mips_le() {
     for _up_c in /bin/busybox /bin/sh /bin/cat; do
         [ -r "$_up_c" ] || continue
-        _up_b="$(od -An -tu1 -j5 -N1 "$_up_c" 2>/dev/null | tr -d ' ')"
+        _up_b="$(dd if="$_up_c" bs=1 skip=5 count=1 2>/dev/null | od -b | awk 'NR==1 {print $2+0}')"
         case "$_up_b" in
             1) return 0 ;;
             2) return 1 ;;
@@ -155,7 +169,7 @@ up_is_mips_le() {
     done
     grep -qi 'little.endian' /proc/cpuinfo 2>/dev/null && return 0
     grep -qi 'big.endian' /proc/cpuinfo 2>/dev/null && return 1
-    return 0
+    return 1
 }
 
 # Источник обновления xray выбирается по НАЛИЧИЮ рабочей сборки, а не
@@ -215,8 +229,8 @@ case "$ARCH" in
         fi
         ;;
     *)
-        echo "❌ $ARCH"
-        exit 1
+        echo "⚠️ $ARCH: GitHub ABI неизвестен, только Entware"
+        HY_FILE=""; XRAY_SOURCE="opkg"; XRAY_FILE=""
         ;;
 esac
 
@@ -542,6 +556,33 @@ restore_hysteria_state() {
     wait_service_ready hysteria "$PORT_HYSTERIA" udp || true
 }
 
+restore_package_inits() {
+    [ -n "$OPKG_INIT_STAGE" ] || return 0
+    _rpi_rc=0
+    for _rpi_f in "$OPKG_INIT_STAGE"/S*; do
+        [ -f "$_rpi_f" ] || continue
+        cp -p "$_rpi_f" "/opt/etc/init.d/${_rpi_f##*/}" || _rpi_rc=1
+    done
+    if [ "$_rpi_rc" -eq 0 ]; then
+        rm -rf "$OPKG_INIT_STAGE"
+        OPKG_INIT_STAGE=""
+    fi
+    return "$_rpi_rc"
+}
+
+opkg_preserve_inits() {
+    OPKG_INIT_STAGE="$(mktemp -d /tmp/keenzoo.opkg-init.XXXXXX)" || return 1
+    for _opi_name in S24xray S22trojan S35tor S56dnsmasq S57hysteria S65shadowsocks; do
+        if [ -f "/opt/etc/init.d/$_opi_name" ]; then
+            cp -p "/opt/etc/init.d/$_opi_name" "$OPKG_INIT_STAGE/$_opi_name" || return 1
+        fi
+    done
+    _opi_rc=0
+    opkg "$@" || _opi_rc=$?
+    restore_package_inits || _opi_rc=1
+    return "$_opi_rc"
+}
+
 update_xray() {
     choose_xray_source
     XRAY_OLD_BIN="$(mktemp /tmp/xray.rollback.XXXXXX)"
@@ -570,14 +611,24 @@ update_xray() {
 
     if [ "$XRAY_SOURCE" = "opkg" ]; then
         # opkg сам заменяет файл, поэтому сервис останавливается перед ним.
-        opkg update >/dev/null 2>&1 || true
+        if ! opkg update >/dev/null 2>&1; then
+            rm -f "$XRAY_OLD_BIN" "$XRAY_OLD_CFG"
+            echo "❌ opkg update failed"
+            return 1
+        fi
         stop_xray
-        opkg upgrade xray >/dev/null 2>&1 || true
+        if ! opkg_preserve_inits upgrade xray >/dev/null 2>&1; then
+            restore_xray_state
+            rm -f "$XRAY_OLD_BIN" "$XRAY_OLD_CFG"
+            echo "❌ opkg upgrade xray failed"
+            return 1
+        fi
+        clean_duplicate_inits
         if xray version >/dev/null 2>&1; then
             echo "✅ xray opkg: $(xray version 2>/dev/null | head -1 | awk '{print $2}')"
         else
             echo "⚠️ opkg xray несовместим, переустановка..."
-            opkg install --force-reinstall xray >/dev/null 2>&1 || true
+            opkg_preserve_inits install --force-reinstall xray >/dev/null 2>&1 || _rc=1
             clean_duplicate_inits
             if ! xray version >/dev/null 2>&1; then
                 echo "❌ xray: рабочая версия не установлена"
@@ -641,7 +692,7 @@ update_xray() {
             # Скачали, но бинарник не запустился — ставим из opkg.
             rm -f "$DEST_TMP"
             stop_xray
-            opkg install --force-reinstall xray >/dev/null 2>&1 || true
+            opkg_preserve_inits install --force-reinstall xray >/dev/null 2>&1 || _rc=1
             clean_duplicate_inits
             if xray version >/dev/null 2>&1; then
                 echo "✅ xray opkg: $(xray version 2>/dev/null | head -1 | awk '{print $2}')"
@@ -808,19 +859,19 @@ clean_duplicate_inits() {
 
     restore_init_args S24xray    xray "run -confdir /opt/etc/xray"
     restore_init_args S35tor     tor  "-f /opt/etc/tor/torrc"
-    restore_init_args S22trojan  trojan ""
+    restore_init_args S22trojan  trojan "-c /opt/etc/trojan/config.json"
     restore_init_args S56dnsmasq dnsmasq ""
 }
 
 update_opkg() {
     echo "⏳ opkg..."
     _opkg_rc=0
-    opkg update >/dev/null 2>&1 || true
+    opkg update >/dev/null 2>&1 || { echo "❌ opkg update failed"; return 1; }
     for pkg in shadowsocks-libev-ss-redir trojan tor dnsmasq-full; do
         avail="$(opkg list-upgradable 2>/dev/null | grep "^${pkg} " || true)"
         if [ -n "$avail" ]; then
             echo "  ⏳ $pkg..."
-            if opkg upgrade "$pkg" >/dev/null 2>&1; then
+            if opkg_preserve_inits upgrade "$pkg" >/dev/null 2>&1; then
                 echo "  ✅ $pkg"
                 # Пакет мог вернуть свой init-скрипт — убираем сразу,
                 # пока сервис не успел подняться вторым экземпляром.
@@ -846,6 +897,10 @@ case "$ACTION" in
         update_xray || RC=1
         ;;
     hysteria)
+        update_hysteria || RC=1
+        ;;
+    github)
+        update_xray || RC=1
         update_hysteria || RC=1
         ;;
     opkg)

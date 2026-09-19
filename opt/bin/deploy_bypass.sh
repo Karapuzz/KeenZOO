@@ -4,6 +4,88 @@ set -eu
 PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 umask 022
 
+# BEGIN KeenZOO embedded live console
+# No external launcher or pipefail is required. The child performs the real
+# deploy; the parent mirrors stdout/stderr and preserves the child's exit code.
+if [ "${KEENZOO_LIVE_CHILD:-0}" = 1 ]; then
+    # Never leak the recursion flag into services started by the installer.
+    unset KEENZOO_LIVE_CHILD
+else
+    _kz_console=0
+    case "${1:-}" in
+        -install|-repair) _kz_console=1; _kz_archive="${2:-${KEENZOO_ARCHIVE:-}}"; _kz_label="${1#-}" ;;
+        *.tar.gz|*.tgz) _kz_console=1; _kz_archive="$1"; _kz_label=install ;;
+    esac
+    if [ "$_kz_console" = 1 ]; then
+        for _kz_tool in tee mktemp date tar; do
+            command -v "$_kz_tool" >/dev/null 2>&1 || {
+                printf 'ERROR: required command missing: %s\n' "$_kz_tool" >&2
+                exit 127
+            }
+        done
+        umask 077
+        KZ_CONSOLE_WORK="$(mktemp -d /tmp/keenzoo-console.XXXXXX)" || exit 1
+        trap 'rm -rf "$KZ_CONSOLE_WORK"' 0
+        KZ_CONSOLE_LOG="/tmp/keenzoo-${_kz_label}-$(date +%Y%m%d-%H%M%S)-$$.log"
+        # Refuse an existing path/symlink instead of truncating someone else's file.
+        if ! (set -C; : > "$KZ_CONSOLE_LOG"); then
+            printf 'ERROR: cannot safely create log: %s\n' "$KZ_CONSOLE_LOG" >&2
+            exit 1
+        fi
+        KZ_CONSOLE_SELF="$0"
+        case "$KZ_CONSOLE_SELF" in
+            */*) ;;
+            *) KZ_CONSOLE_SELF="$(command -v "$KZ_CONSOLE_SELF")" || exit 127 ;;
+        esac
+        printf 'Live console enabled. Log: %s\n' "$KZ_CONSOLE_LOG"
+        if (
+            trap - 0
+            printf '\n=== KeenZOO hybrid terminal installation ===\n'
+            date
+            printf 'Mode: %s\nArchive: %s\n' "$_kz_label" "$_kz_archive"
+            if [ ! -s "$_kz_archive" ] || [ ! -r "$_kz_archive" ]; then
+                printf 'ERROR: archive missing, empty or unreadable: %s\n' "$_kz_archive" >&2
+                _kz_child_rc=1
+            elif ! tar tzf "$_kz_archive" > "$KZ_CONSOLE_WORK/members"; then
+                printf '%s\n' 'ERROR: archive cannot be read. Installer was not started.' >&2
+                _kz_child_rc=1
+            else
+                if command -v sha256sum >/dev/null 2>&1; then
+                    sha256sum "$_kz_archive" || true
+                fi
+                if KEENZOO_LIVE_CHILD=1 /bin/sh "$KZ_CONSOLE_SELF" "$@"; then
+                    _kz_child_rc=0
+                else
+                    _kz_child_rc=$?
+                fi
+            fi
+            if ! printf '%s\n' "$_kz_child_rc" > "$KZ_CONSOLE_WORK/status"; then
+                printf '%s\n' 'ERROR: installer exit status could not be recorded.' >&2
+                exit 125
+            fi
+            printf '\nDeploy exit code: %s\nLog: %s\n' "$_kz_child_rc" "$KZ_CONSOLE_LOG"
+            exit "$_kz_child_rc"
+        ) 2>&1 | tee -a "$KZ_CONSOLE_LOG"; then
+            _kz_tee_rc=0
+        else
+            _kz_tee_rc=$?
+        fi
+        if [ ! -s "$KZ_CONSOLE_WORK/status" ]; then
+            printf 'ERROR: no reliable installer exit status; success is NOT confirmed. Log: %s\n' "$KZ_CONSOLE_LOG" >&2
+            exit 125
+        fi
+        IFS= read -r _kz_final_rc < "$KZ_CONSOLE_WORK/status" || exit 125
+        case "$_kz_final_rc" in ''|*[!0-9]*) exit 125 ;; esac
+        [ "$_kz_final_rc" -le 255 ] || exit 125
+        if [ "$_kz_tee_rc" -ne 0 ]; then
+            printf 'ERROR: tee failed (rc=%s); log/console output may be incomplete.\n' "$_kz_tee_rc" >&2
+            [ "$_kz_final_rc" -ne 0 ] || exit 74
+        fi
+        exit "$_kz_final_rc"
+    fi
+fi
+# END KeenZOO embedded live console
+
 # Деплой импортирует bot_config для проверки конфигурации, а это создаёт
 # __pycache__ в /opt/etc/bot от имени root — потом он подменял правленый
 # модуль. Кэш байткода на USB-накопителе не нужен: модули читаются один
@@ -89,7 +171,7 @@ die() {
 # deploy_bypass.sh /path/to/archive.tar.gz remains supported as install.
 MODE="${1:-}"
 case "$MODE" in
-    -install)
+    -install|-repair)
         ARCHIVE="${2:-${KEENZOO_ARCHIVE:-}}"
         ;;
     -backup)
@@ -118,6 +200,7 @@ case "$MODE" in
         cat >&2 <<'EOF'
 Использование:
   deploy_bypass.sh -install ARCHIVE
+  deploy_bypass.sh -repair ARCHIVE  # установленный проект, без скачиваний
   deploy_bypass.sh -backup DESTINATION_DIR
   deploy_bypass.sh -remove --backup-dir DESTINATION_DIR [--yes]
   deploy_bypass.sh ARCHIVE
@@ -138,6 +221,8 @@ DEPLOY_LOCK_ACQUIRED=0
 DEPLOY_LOCK_STALE=120
 EXTRACT_STAGE=""
 PRESERVE_STAGE=""
+REPAIR_LOCK_ACQUIRED=0
+REPAIR_LOCK_DIR=""
 
 lock_owner_live() {
     _lol_dir="$1"
@@ -161,6 +246,7 @@ lock_age() {
 
 cleanup_deploy_lock() {
     _cdl_rc=$?
+    if [ "$REPAIR_LOCK_ACQUIRED" -eq 1 ]; then rm -rf "$REPAIR_LOCK_DIR"; fi
     [ -n "$EXTRACT_STAGE" ] && rm -rf "$EXTRACT_STAGE"
     [ -n "$PRESERVE_STAGE" ] && rm -rf "$PRESERVE_STAGE"
     if [ "$DEPLOY_LOCK_ACQUIRED" -eq 1 ]; then
@@ -189,7 +275,10 @@ DEPLOY_LOCK_ACQUIRED=1
 printf '%s\n' "$$" > "$DEPLOY_LOCK_DIR/pid"
 awk '{print $22}' "/proc/$$/stat" 2>/dev/null > "$DEPLOY_LOCK_DIR/start" || true
 date +%s > "$DEPLOY_LOCK_DIR/ts" 2>/dev/null || true
-trap cleanup_deploy_lock EXIT INT TERM HUP
+trap cleanup_deploy_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 remove_managed_file_sections() {
     _rm_file="$1"
@@ -235,7 +324,7 @@ purge_project_policy_tables() {
             | awk '{print $1}' | head -1 || true)"
         [ -n "$_rpt_id" ] || continue
         _rpt_ipt="$(command -v iptables 2>/dev/null || true)"
-        _rpt_set="unblockvpn-${_rpt_if}"
+        _rpt_set="unblock${_rpt_base}"
         if [ -n "$_rpt_ipt" ]; then
             for _rpt_proto in tcp udp; do
                 while "$_rpt_ipt" -w -t mangle -D PREROUTING \
@@ -253,6 +342,9 @@ purge_project_policy_tables() {
         ip -4 rule del fwmark "0xd$_rpt_id" lookup "$_rpt_id" \
             priority 1778 >/dev/null 2>&1 || true
         ip -4 route flush table "$_rpt_id" >/dev/null 2>&1 || true
+        ipset flush "$_rpt_set" >/dev/null 2>&1 || true
+        ipset destroy "${_rpt_set}_new" >/dev/null 2>&1 || true
+        ipset destroy "$_rpt_set" >/dev/null 2>&1 || true
         _rpt_tmp="/opt/etc/iproute2/rt_tables.remove.$$"
         awk -v n="$_rpt_name" '$2 != n' /opt/etc/iproute2/rt_tables > "$_rpt_tmp" \
             2>/dev/null && mv -f "$_rpt_tmp" /opt/etc/iproute2/rt_tables \
@@ -339,6 +431,9 @@ remove_project() {
         die "❌ Неинтерактивный -remove требует --yes"
     fi
 
+    mkdir -p /opt/etc/unblock || return 1
+    : > /opt/etc/unblock/.disabled || return 1
+
     for _rm_svc in \
         S99telegram_bot S99generator S99unblock \
         S24xray S22trojan S57hysteria S65shadowsocks S35tor
@@ -352,7 +447,7 @@ remove_project() {
     # removal mode and does not inspect ENABLED/process state.
     _rm_purge_ok=1
     if [ -x /opt/etc/ndm/netfilter.d/100-redirect.sh ]; then
-        for _rm_table in nat mangle filter; do
+        for _rm_table in nat filter; do
             if ! PURGE_PROJECT=1 KEENZOO_UPDATE_LOCK_HELD=0 \
                 type=iptable table="$_rm_table" \
                 /opt/etc/ndm/netfilter.d/100-redirect.sh \
@@ -401,7 +496,281 @@ remove_project() {
     echo "   Backup: $BACKUP_DIR"
 }
 
+# Offline repair of an ALREADY INSTALLED project. No package downloads,
+# binary/config replacement, DNSOverride changes or protocol restarts.
+repair_dns_ready() {
+    command -v dig >/dev/null 2>&1 || return 1
+    dig -4 +short +time=3 +tries=2 example.com A @127.0.0.1 -p 53 2>/dev/null \
+        | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+repair_restore_code() {
+    _rrc_ok=0
+    for _rrc_rel in $REPAIR_FILES; do
+        if [ -f "$REPAIR_BACKUP/$_rrc_rel" ]; then
+            cp -p "$REPAIR_BACKUP/$_rrc_rel" "/opt/$_rrc_rel" || _rrc_ok=1
+        else
+            rm -f "/opt/$_rrc_rel" || _rrc_ok=1
+        fi
+    done
+    return "$_rrc_ok"
+}
+
+# Migrate only owned DNS policy/cron settings; never execute credentials.
+v4_migrate_settings() {
+    python3 - <<'PY_V4_MIGRATE'
+import ast, os, pathlib, re, shutil, time
+config = pathlib.Path('/opt/etc/bot/bot_config.py')
+cron = pathlib.Path('/opt/etc/crontab')
+source = config.read_text(encoding='utf-8')
+tree = ast.parse(source)
+assignments = {}
+for node in tree.body:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                assignments.setdefault(target.id, []).append(node)
+mode = assignments.get('dns_policy_mode', [])
+try:
+    hybrid = bool(mode and ast.literal_eval(mode[-1].value) == 'hybrid')
+except (ValueError, TypeError):
+    hybrid = False
+values = {'tunnel_protocol_priority': "['hysteria', 'xray', 'trojan']",
+          'dns_policy_version': '4', 'dns_policy_mode': "'hybrid'",
+          'dns_policy_pool_hours': '[11, 23]', 'dns_policy_recovery_interval': '300'}
+# Upgrade from the old 15/300-second policy MUST change existing values, not
+# merely append defaults. Subsequent hybrid repairs keep a valid 30..60 min choice.
+interval = 3600
+if hybrid and assignments.get('dns_policy_interval'):
+    interval = ast.literal_eval(assignments['dns_policy_interval'][-1].value)
+    if type(interval) is not int or not 1800 <= interval <= 3600:
+        raise SystemExit('Hybrid control interval must be 1800..3600; configuration was not changed')
+values['dns_policy_interval'] = str(interval)
+owned = set(values) | {'dns_policy_pool_interval'}
+for node in tree.body:
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id in owned:
+        raise SystemExit('DNS migration refuses annotated settings; use simple assignments')
+lines = source.splitlines(keepends=True)
+changes = []
+for name in owned:
+    nodes = assignments.get(name, [])
+    for node in nodes:
+        if len(node.targets) != 1:
+            raise SystemExit('DNS policy migration refuses chained assignments')
+        before = lines[node.lineno-1][:node.col_offset].strip()
+        after = lines[node.end_lineno-1][node.end_col_offset:].strip()
+        if before or (after and not after.startswith('#')):
+            raise SystemExit('DNS migration refuses shared-line statements; settings were not changed')
+        # Remove legacy pool interval and earlier duplicate assignments.
+        text = name + ' = ' + values[name] + '\n' if name in values and node is nodes[-1] else ''
+        changes.append((node.lineno-1, node.end_lineno, text))
+for first, end, text in sorted(changes, reverse=True):
+    lines[first:end] = [text]
+new = ''.join(lines)
+for name, value in values.items():
+    if name not in assignments:
+        new += '\n' + name + ' = ' + value + '\n'
+ast.parse(new)
+# Preserve unrelated cron jobs, including user run-parts schedules. Remove
+# only known KeenZOO DNS/list entries with minute/five-minute cadence.
+command = re.compile(r'/opt/(?:etc/init\.d/S99unblock\b|etc/bot/utils\.py\s+--dns-[\w-]+\b|bin/(?:unblock_dnsmasq|unblock_update|unblock_ipset)\.sh\b)')
+frequent = {'*', '*/1', '*/5', '0-59/1', '0-59/5'}
+def clean_cron(text):
+    result = []
+    for line in text.splitlines(keepends=True):
+        fields = line.split()
+        if not fields or line.lstrip().startswith('#'):
+            result.append(line); continue
+        body = line.split('#', 1)[0]
+        owned_command = command.search(body)
+        if owned_command and any(op in body for op in (';', '&&', '||', '|')):
+            print('WARNING: compound cron entry preserved; inspect manually:', line.strip())
+            result.append(line); continue
+        if owned_command and len(fields) >= 6 and fields[0] in frequent and fields[1] == '*':
+            print('Removed frequent KeenZOO cron entry:', line.strip())
+            continue
+        result.append(line)
+    return ''.join(result)
+updates = {config: new}
+cron_paths = [cron]
+spool = pathlib.Path('/opt/var/spool/cron/crontabs')
+if spool.is_dir():
+    cron_paths += [p for p in spool.iterdir() if p.is_file() and not p.is_symlink()]
+for path in cron_paths:
+    if path.is_symlink():
+        raise SystemExit('Refusing symlinked cron file: ' + str(path))
+    text = path.read_text() if path.exists() else ''
+    updates[path] = clean_cron(text)
+remove = []
+for directory in ('/opt/etc/cron.1min', '/opt/etc/cron.5mins'):
+    root = pathlib.Path(directory)
+    if not root.is_dir():
+        continue
+    for path in root.iterdir():
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            text = path.read_text()
+        except (UnicodeError, OSError):
+            continue
+        executable = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith('#')]
+        if len(executable) == 1 and re.match(r'^(?:exec\s+)?/opt/', executable[0]) and command.search(executable[0]):
+            remove.append(path)
+        elif command.search(text):
+            print('WARNING: custom cron wrapper preserved; inspect manually:', path)
+changed = {path: text for path, text in updates.items()
+           if not path.exists() or path.read_text() != text}
+if changed or remove:
+    backup = pathlib.Path('/opt/root/keenzoo-hybrid-settings-' + time.strftime('%Y%m%d-%H%M%S') + '-' + str(os.getpid()))
+    backup.mkdir(mode=0o700, parents=True, exist_ok=False)
+    # Build all replacements first. Credentials and cron backups remain private.
+    staged = []
+    try:
+        for path in list(changed) + remove:
+            if path.exists():
+                dst = backup / path.relative_to(config.parents[2])
+                dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                shutil.copy2(path, dst); os.chmod(dst, 0o600)
+        for path, text in changed.items():
+            temporary = path.with_name(path.name + '.hybrid.' + str(os.getpid()))
+            fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(text)
+            staged.append((temporary, path))
+        for temporary, path in staged:
+            os.replace(temporary, path)
+        for path in remove:
+            path.unlink()
+            print('Removed simple frequent KeenZOO wrapper:', path)
+        # Cronie/crond checks the spool directory mtime for root crontab updates.
+        if spool.is_dir():
+            os.utime(spool, None)
+    finally:
+        for temporary, path in staged:
+            if temporary.exists():
+                temporary.unlink()
+    print('DNS hybrid settings backup:', backup)
+print('DNS hybrid: idle control=' + str(interval) + 's; pool=11:00/23:00 router local; Primary recovery=300s')
+print('DNS policy: Hysteria -> Xray -> Trojan; emergency bootstrap TCP/UDP53 enabled')
+PY_V4_MIGRATE
+}
+
+repair_installed_project() {
+    [ -s "$ARCHIVE" ] || die "❌ Укажите локальный исправленный архив для -repair"
+    [ -f /opt/etc/unblock/.disabled ] && die "❌ Проект отключён; -repair не включает его автоматически"
+    [ -f /opt/etc/bot/bot_config.py ] && [ ! -L /opt/etc/bot/bot_config.py ] \
+        || die "❌ Для repair требуется сохранённый bot_config.py установленного проекта"
+    REPAIR_FILES='bin/update_protocols.sh bin/backup_project.sh bin/unblock_dnsmasq.sh bin/unblock_update.sh bin/check_updates.sh bin/deploy_bypass.sh etc/ndm/netfilter.d/100-redirect.sh etc/bot/generator.py etc/bot/utils.py etc/init.d/S99unblock etc/ndm/ifstatechanged.d/100-unblock-vpn.sh bin/unblock_ipset.sh bin/rotate_logs.sh etc/bot/version.md'
+    # BusyBox tar normalizes absolute names even in -t output. Include its
+    # warnings in the strict allow-list check, otherwise /opt/x looks like opt/x.
+    _ri_members="$(tar tzf "$ARCHIVE" 2>&1)" || die "❌ Повреждён архив"
+    if printf '%s\n' "$_ri_members" | grep -qvE '^(\./)?opt(/[A-Za-z0-9_.-]+)*/?$' \
+        || printf '%s\n' "$_ri_members" | grep -qE '(^|/)\.\.(/|$)'; then
+        die "❌ Небезопасные пути в архиве"
+    fi
+    _ri_types="$(tar tvzf "$ARCHIVE" 2>/dev/null)" || die "❌ Не прочитан архив"
+    if printf '%s\n' "$_ri_types" | awk 'NF && substr($1,1,1) !~ /^[-d]$/ {bad=1} END {exit !bad}'; then
+        die "❌ Ссылки и специальные файлы в repair-архиве запрещены"
+    fi
+    EXTRACT_STAGE="$(mktemp -d /tmp/keenzoo.repair.XXXXXX)" || die "❌ Нет места для staging"
+    tar xzf "$ARCHIVE" -C "$EXTRACT_STAGE" || die "❌ Распаковка не выполнена"
+    for _ri_rel in $REPAIR_FILES; do
+        [ -f "$EXTRACT_STAGE/opt/$_ri_rel" ] && [ ! -L "$EXTRACT_STAGE/opt/$_ri_rel" ] \
+            || die "❌ В архиве нет $_ri_rel"
+        [ ! -L "/opt/$_ri_rel" ] && { [ ! -e "/opt/$_ri_rel" ] || [ -f "/opt/$_ri_rel" ]; } \
+            || die "❌ Небезопасный целевой файл: /opt/$_ri_rel"
+        case "$_ri_rel" in
+            *.sh|etc/init.d/*) sh -n "$EXTRACT_STAGE/opt/$_ri_rel" || die "❌ Ошибка shell: $_ri_rel" ;;
+            *.py) python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' \
+                "$EXTRACT_STAGE/opt/$_ri_rel" || die "❌ Ошибка Python: $_ri_rel" ;;
+        esac
+    done
+    # A binary update may restart tunnels while DNS is being repaired.
+    _ri_proto_lock=/tmp/keenzoo_protocol_update.lockdir
+    if [ -d "$_ri_proto_lock" ]; then
+        lock_owner_live "$_ri_proto_lock" && die "❌ Выполняется обновление протоколов; дождитесь окончания"
+        _ri_age="$(lock_age "$_ri_proto_lock" || true)"
+        case "$_ri_age" in ''|*[!0-9]*) die "❌ Не проверен protocol update lock" ;; esac
+        [ "$_ri_age" -ge 120 ] || die "❌ Protocol update lock свежий; повторите позднее"
+    fi
+    # Refuse a busy/live or newly-created mutex; never kill an update worker.
+    REPAIR_LOCK_DIR="${KEENZOO_LOCK_DIR:-/tmp/unblock_update.lockdir}"
+    if ! mkdir "$REPAIR_LOCK_DIR" 2>/dev/null; then
+        lock_owner_live "$REPAIR_LOCK_DIR" && die "❌ Выполняется обновление; дождитесь его окончания"
+        _ri_age="$(lock_age "$REPAIR_LOCK_DIR" || true)"
+        case "$_ri_age" in ''|*[!0-9]*) die "❌ Не проверен владелец update lock" ;; esac
+        [ "$_ri_age" -ge 120 ] || die "❌ Update lock свежий; повторите позднее"
+        rm -rf "$REPAIR_LOCK_DIR"
+        mkdir "$REPAIR_LOCK_DIR" || die "❌ Не получена блокировка"
+    fi
+    REPAIR_LOCK_ACQUIRED=1
+    printf '%s\n' "$$" > "$REPAIR_LOCK_DIR/pid"
+    awk '{print $22}' "/proc/$$/stat" > "$REPAIR_LOCK_DIR/start"
+    REPAIR_BACKUP="/opt/root/keenzoo-repair-$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir -p "$REPAIR_BACKUP" || die "❌ Нет места для резервной копии"
+    chmod 0700 "$REPAIR_BACKUP" || die "❌ Не защищён каталог резервной копии"
+    for _ri_rel in $REPAIR_FILES etc/bot/bot_config.py etc/crontab etc/dnsmasq.conf etc/hosts etc/unblock.dnsmasq etc/unblock.dnsmasq.cidr; do
+        [ -f "/opt/$_ri_rel" ] || continue
+        mkdir -p "$REPAIR_BACKUP/$(dirname "$_ri_rel")"
+        cp -p "/opt/$_ri_rel" "$REPAIR_BACKUP/$_ri_rel" || die "❌ Не создан backup $_ri_rel"
+    done
+    echo "Backup кода и DNS-файлов (не полный образ роутера): $REPAIR_BACKUP"
+    if grep -q 'class DNSPolicyV4' /opt/etc/bot/utils.py 2>/dev/null; then
+        python3 /opt/etc/bot/utils.py --dns-stop || die "DNS v4 worker could not stop safely"
+    fi
+    for _ri_rel in $REPAIR_FILES; do
+        mkdir -p "/opt/$(dirname "$_ri_rel")" || die "❌ Не создан каталог $_ri_rel"
+        _ri_tmp="/opt/${_ri_rel}.repair.$$"
+        _ri_mode=0755
+        case "$_ri_rel" in *.py|*.md) _ri_mode=0644 ;; esac
+        if ! { cp "$EXTRACT_STAGE/opt/$_ri_rel" "$_ri_tmp" \
+            && chmod "$_ri_mode" "$_ri_tmp" && mv -f "$_ri_tmp" "/opt/$_ri_rel"; }; then
+            rm -f "$_ri_tmp"
+            repair_restore_code || warn "❌ Не весь код восстановлен: $REPAIR_BACKUP"
+            die "❌ Запись кода не завершена"
+        fi
+    done
+    v4_migrate_settings || die "DNS v4 settings migration failed"
+    echo "✅ Код v4 обновлён; ключи, списки и бинарники сохранены; DNS-настройки мигрированы"
+    _ri_ok=1
+    # Phase 1 creates a usable DNS baseline, so a later ipset transaction can
+    # roll back to THIS baseline rather than to the broken installed snapshot.
+    if ! KEENZOO_LOCK_DIR="$REPAIR_LOCK_DIR" KEENZOO_UPDATE_LOCK_HELD=1 \
+        DNS_HEALTH_ONLY=1 /opt/bin/unblock_dnsmasq.sh; then
+        _ri_ok=0
+        warn "❌ DNS health/туннель не восстановлен; см. unblock_dns_health.log"
+    fi
+    rm -rf "$REPAIR_LOCK_DIR"
+    REPAIR_LOCK_ACQUIRED=0
+    if [ "$_ri_ok" = 1 ]; then
+        if ! /opt/bin/unblock_update.sh; then
+            _ri_ok=0
+            warn "❌ Не завершено обновление списков; DNS baseline сохраняется через rollback"
+        fi
+    fi
+    # Reload the new Python routes. No proxy daemon is stopped/restarted here.
+    if [ -x /opt/etc/init.d/S99generator ]; then
+        /opt/etc/init.d/S99generator restart || _ri_ok=0
+    fi
+    if ! repair_dns_ready; then
+        _ri_ok=0
+        warn "❌ Нет IPv4 DNS-ответа через 127.0.0.1:53; не перезагружайте роутер"
+    fi
+    if [ "$_ri_ok" != 1 ]; then
+        warn "⚠️ Repair неполный. Исправленный код оставлен для диагностики; настройки не сброшены"
+        return 1
+    fi
+    echo "✅ Repair: DNS отвечает, списки пересобраны, панель перезапущена"
+    echo "   Проверьте сайты из LAN и WireGuard до перезагрузки"
+}
+
 case "$MODE" in
+    -repair)
+        # Execute directly (not in an if/! context): ash must keep errexit
+        # enabled inside the function for failed backup/filesystem operations.
+        repair_installed_project
+        exit $?
+        ;;
     -backup)
         [ -n "$BACKUP_DIR" ] || die "❌ Для -backup требуется DESTINATION_DIR"
         case "$BACKUP_DIR" in
@@ -542,7 +911,7 @@ detect_endian() {
     done
 
     if [ -n "$_de_probe" ] && have_cmd od; then
-        _de_b="$(od -An -tu1 -j5 -N1 "$_de_probe" 2>/dev/null | tr -d ' ')"
+        _de_b="$(dd if="$_de_probe" bs=1 skip=5 count=1 2>/dev/null | od -b | awk 'NR==1 {print $2+0}')"
         case "$_de_b" in
             1) printf 'le\n'; return 0 ;;
             2) printf 'be\n'; return 0 ;;
@@ -556,9 +925,8 @@ detect_endian() {
         printf 'be\n'; return 0
     fi
 
-    # Значение по умолчанию: подавляющее большинство Keenetic на MIPS —
-    # little-endian (mipsel).
-    printf 'le\n'
+    # Do not guess the ABI when no probe succeeded.
+    printf 'unknown\n'
 }
 
 # Проверка ABI с плавающей точкой: Entware для MIPS/ARM собран
@@ -579,7 +947,7 @@ case "$ARCH" in
         XRAY_FILE="Xray-linux-arm32-v7a.zip"
         ;;
     armv6l|armv6)
-        ENTWARE_ARCH="armv7sf-k3.2"
+        ENTWARE_ARCH="armv5sf-k3.2"
         HY_FILE="hysteria-linux-armv5"
         XRAY_SOURCE="github"
         XRAY_FILE="Xray-linux-arm32-v6.zip"
@@ -591,20 +959,25 @@ case "$ARCH" in
         XRAY_FILE="Xray-linux-arm32-v5.zip"
         ;;
     mips|mipsel|mipsle)
-        if [ "$(detect_endian)" = "be" ]; then
-            # Big-endian MIPS: сборок Hysteria под него не выпускают.
-            ENTWARE_ARCH="mipssf-k3.4"
-            HY_FILE=""
-            XRAY_SOURCE="github"
-            XRAY_FILE="Xray-linux-mips32.zip"
-            echo "ℹ️ MIPS big-endian: Hysteria2 недоступна (нет сборок)"
-        else
-            ENTWARE_ARCH="mipselsf-k3.4"
-            # Entware — soft-float, поэтому именно вариант "-sf".
-            HY_FILE="hysteria-linux-mipsle-sf"
-            XRAY_SOURCE="github"
-            XRAY_FILE="Xray-linux-mips32le.zip"
-        fi
+        case "$(detect_endian)" in
+            le)
+                ENTWARE_ARCH="mipselsf-k3.4"
+                HY_FILE="hysteria-linux-mipsle-sf"
+                XRAY_SOURCE="github"
+                XRAY_FILE="Xray-linux-mips32le.zip"
+                ;;
+            be)
+                ENTWARE_ARCH="mipssf-k3.4"
+                HY_FILE=""
+                XRAY_SOURCE="opkg"
+                XRAY_FILE=""
+                echo "ℹ️ MIPS big-endian: Xray из Entware, Hysteria2 недоступна"
+                ;;
+            *)
+                ENTWARE_ARCH=""; HY_FILE=""; XRAY_SOURCE="opkg"; XRAY_FILE=""
+                warn "⚠️ MIPS endian неизвестен: только существующий feed Entware"
+                ;;
+        esac
         ;;
     x86_64|amd64)
         ENTWARE_ARCH="x64-k3.2"
@@ -1156,7 +1529,7 @@ service_ready() {
             ;;
         S56dnsmasq)
             proc_exact dnsmasq || return 1
-            command -v dig >/dev/null 2>&1 || return 0
+            command -v dig >/dev/null 2>&1 || return 1
             dig +short +time=2 +tries=1 example.com \
                 @127.0.0.1 -p 53 2>/dev/null | \
                 grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
@@ -1169,48 +1542,31 @@ service_ready() {
     esac
 }
 
-web_panel_ready() {
+# Transport acceptance is not DNS health. Accept authentication challenges,
+# but never label a 404/500/503 application failure as a healthy endpoint.
+http_endpoint_ready() {
+    _her_path="$1"
     socket_ready "$WEB_PORT" tcp || return 1
     if command -v curl >/dev/null 2>&1; then
-        curl -sS --noproxy '*' --connect-timeout 2 --max-time 4 \
-            -o /dev/null "http://127.0.0.1:${WEB_PORT}/" \
-            >/dev/null 2>&1
-        return $?
+        _her_code="$(curl -sS --noproxy '*' --connect-timeout 2 --max-time 5 \
+            -o /dev/null -w '%{http_code}' \
+            "http://127.0.0.1:${WEB_PORT}${_her_path}" 2>/dev/null)" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        _her_code="$(wget -S -T 5 -O /dev/null \
+            "http://127.0.0.1:${WEB_PORT}${_her_path}" 2>&1 \
+            | awk '/HTTP\/[0-9.]+ [0-9]+/ {code=$2} END {print code}')"
+    else
+        return 1
     fi
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -T 3 -O /dev/null \
-            "http://127.0.0.1:${WEB_PORT}/" >/dev/null 2>&1
-        _wprc=$?
-        # BusyBox wget returns 8 for an HTTP error response (401 is
-        # expected before panel authentication); that still proves the HTTP
-        # server is alive. Exit 1 is a transport/argument failure.
-        case "$_wprc" in 0|8) return 0 ;; esac
-        return "$_wprc"
-    fi
-    return 0
+    case "$_her_code" in 200|401|403) return 0 ;; *) return 1 ;; esac
 }
 
-# Check the endpoint used by the DNS widget, not only /. A 401/403/503 is
-# still a valid transport result when Basic auth or panel credentials are not
-# available to the installer; connection refusal and 404 are not.
+web_panel_ready() {
+    http_endpoint_ready /
+}
+
 web_panel_dns_status_ready() {
-    socket_ready "$WEB_PORT" tcp || return 1
-    if command -v curl >/dev/null 2>&1; then
-        curl -sS --noproxy '*' --connect-timeout 2 --max-time 5 \
-            -o /dev/null \
-            "http://127.0.0.1:${WEB_PORT}/api/dns-status" \
-            >/dev/null 2>&1
-        return $?
-    fi
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -T 3 -O /dev/null \
-            "http://127.0.0.1:${WEB_PORT}/api/dns-status" \
-            >/dev/null 2>&1
-        _wps_rc=$?
-        case "$_wps_rc" in 0|8) return 0 ;; esac
-        return "$_wps_rc"
-    fi
-    return 1
+    http_endpoint_ready /api/dns-status
 }
 
 wait_service_ready() {
@@ -1873,7 +2229,7 @@ fi
 # а сама точка требовалась, поэтому запись "opt/..." не совпадала и любой
 # корректный архив отклонялся. Правильно — '(\./)?', где необязательна
 # вся последовательность "./".
-if tar tzf "$ARCHIVE" 2>/dev/null | grep -qvE '^(\./)?(opt/|opt$|$)'; then
+if tar tzf "$ARCHIVE" 2>&1 | grep -qvE '^(\./)?(opt/|opt$|$)'; then
     die "❌ Архив содержит файлы вне opt/ — установка прервана"
 fi
 
@@ -1957,17 +2313,23 @@ _preserve_file() {
 }
 for _pf in \
     /opt/etc/dnsmasq.conf \
+    /opt/etc/crontab \
     /opt/etc/hosts \
     /opt/etc/bot/bot_config.py \
     /opt/etc/xray/config.json \
     /opt/etc/trojan/config.json \
     /opt/etc/hysteria/config.json \
     /opt/etc/shadowsocks.json \
-    /opt/etc/tor/torrc
+    /opt/etc/tor/torrc \
+    /opt/etc/unblock/*.txt \
+    /opt/etc/unblock/.router_protocol
  do
     _preserve_file "$_pf" || die "❌ Не удалось сохранить $_pf"
 done
 
+    if grep -q 'class DNSPolicyV4' /opt/etc/bot/utils.py 2>/dev/null; then
+        python3 /opt/etc/bot/utils.py --dns-stop || die "DNS v4 worker could not stop safely"
+    fi
 mkdir -p /opt
 if ! cp -R "$EXTRACT_STAGE/opt/." /opt/ >/dev/null 2>&1; then
     die "❌ Не удалось установить staged-файлы в /opt"
@@ -1979,6 +2341,7 @@ rm -rf "$EXTRACT_STAGE"
 EXTRACT_STAGE=""
 rm -rf "$PRESERVE_STAGE"
 PRESERVE_STAGE=""
+rm -f /opt/etc/unblock/.disabled
 echo "✅ Архив проверен и установлен через staging; пользовательские настройки сохранены"
 
 find /opt/bin -name "*.sh" \
@@ -2254,6 +2617,8 @@ touch /opt/etc/bot/error.log
 # каждом старте. Создаём пустой файл, чтобы не засорять лог роутера.
 [ -f /opt/etc/hosts ] || : > /opt/etc/hosts
 chmod 0644 /opt/etc/hosts 2>/dev/null || true
+
+v4_migrate_settings || die "DNS v4 settings migration failed"
 
 # cron отказывается выполнять задания из crontab с правами шире 0600 и
 # пишет в журнал "(*system*) BAD FILE MODE (/opt/etc/crontab)". Файл при
@@ -2559,14 +2924,14 @@ report_protocols_not_started
 if [ -x /opt/etc/ndm/fs.d/100-ipset.sh ]; then
     /opt/etc/ndm/fs.d/100-ipset.sh >/dev/null 2>&1 || true
 fi
-safe_start_service "S99unblock"
+python3 /opt/etc/bot/utils.py --dns-start || die "DNS v4 controller did not start"
 
 # Списки наполняются синхронно: правила ниже и проверка в конце должны
 # видеть готовые наборы. Проверка endpoint и pinning выполняются внутри
 # существующего unblock_dnsmasq.sh; отдельный bootstrap-файл не создаётся.
 if [ -x /opt/bin/unblock_update.sh ]; then
     echo "   Наполнение списков (до нескольких минут)..."
-    if /opt/bin/unblock_update.sh >/dev/null 2>&1; then
+    if /opt/bin/unblock_update.sh; then
         echo "✅ Списки обновлены"
     else
         warn "⚠️ unblock_update.sh вернул ошибку"
@@ -2582,7 +2947,7 @@ fi
 # итоговый флаг используется в финальной диагностике.
 NETFILTER_OK=1
 if [ -x /opt/etc/ndm/netfilter.d/100-redirect.sh ]; then
-    for _nf_table in nat mangle filter; do
+    for _nf_table in nat filter; do
         _nf_log="$(mktemp /tmp/redirect.${_nf_table}.XXXXXX)"
         if ! type=iptable table="$_nf_table"             /opt/etc/ndm/netfilter.d/100-redirect.sh >"$_nf_log" 2>&1; then
             NETFILTER_OK=0
@@ -2954,7 +3319,9 @@ if ! ensure_local_resolver; then
     warn "    ⚠️ Не удалось установить nameserver 127.0.0.1 в /etc/resolv.conf"
 fi
 
-if dns_ok; then
+DEPLOY_DNS_READY=0
+if service_ready S56dnsmasq && dns_ok; then
+    DEPLOY_DNS_READY=1
     echo "    ✅ Резолвинг на роутере работает через локальный dnsmasq"
 else
     warn "    ⚠️ Роутер не резолвит имена — бот работать не сможет"
@@ -2996,9 +3363,15 @@ echo "    curl --http3 -sI https://www.google.com --max-time 10 | head -1"
 echo "  Затем на роутере счётчики должны вырасти:"
 echo "    $IPT_BIN -t mangle -L PREROUTING -v -n | grep TPROXY"
 echo ""
-echo "  ⚠️ Завершите установку перезагрузкой: reboot"
+if [ "$DEPLOY_DNS_READY" = 1 ]; then
+    echo "  Проверьте сайты из LAN/WireGuard; только затем выполните reboot"
+else
+    warn "  ❌ Установка не прошла DNS readiness. Не перезагружайте роутер"
+    warn "     Используйте -repair с локальным исправленным архивом и сохраните логи"
+fi
 echo ""
 echo "  🔴 Отзовите и перевыпустите секреты из репозитория"
 echo "     (токен @BotFather /revoke, ключи VLESS/Trojan/Hysteria)."
 echo ""
 echo "════════════════════════════════════"
+[ "$DEPLOY_DNS_READY" = 1 ] || exit 1

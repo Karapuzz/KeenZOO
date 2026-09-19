@@ -1,4 +1,8 @@
 #!/bin/sh
+# remove leaves init files for backup; block future starts, not stop/status.
+if [ -f /opt/etc/unblock/.disabled ]; then
+    case "${1:-start}" in start|restart|reconfigure|reload) exit 0 ;; esac
+fi
 # /opt/etc/init.d/S57hysteria
 # Hysteria 2 transparent client for Keenetic/Entware BusyBox.
 # The service is deliberately started here, after S56dnsmasq. Unlike the

@@ -1,4 +1,8 @@
 #!/bin/sh
+# remove leaves init files for backup; block future starts, not stop/status.
+if [ -f /opt/etc/unblock/.disabled ]; then
+    case "${1:-start}" in start|restart|reconfigure|reload) exit 0 ;; esac
+fi
 # Tor запускается после локального dnsmasq: на Keenetic init.d вызывается
 # лексикографически, поэтому S35tor раньше S56dnsmasq. Если DNS ещё не
 # поднят, откладываем только старт Tor, не блокируя загрузку прошивки.
@@ -61,7 +65,10 @@ if [ "${1:-}" = "start" ] && [ "${KEENZOO_TOR_DEFERRED:-0}" != "1" ]; then
 
         if mkdir "$TOR_WAIT_LOCK" 2>/dev/null; then
             (
-                trap 'rm -rf "$TOR_WAIT_LOCK" 2>/dev/null || true' EXIT INT TERM HUP
+                trap 'rm -rf "$TOR_WAIT_LOCK" 2>/dev/null || true' EXIT
+                trap 'exit 130' INT
+                trap 'exit 143' TERM
+                trap 'exit 129' HUP
                 _tor_wait=0
                 while [ "$_tor_wait" -lt "$TOR_WAIT_MAX" ]; do
                     tor_dns_ready && break

@@ -1,4 +1,8 @@
 #!/bin/sh
+# remove keeps data but disables cron/NDM reactivation until next install.
+if [ -f /opt/etc/unblock/.disabled ] && [ "${PURGE_PROJECT:-0}" != 1 ]; then
+    exit 0
+fi
 # /opt/bin/unblock_update.sh
 # Единственная точка применения списков обхода:
 #   1) генерация конфига dnsmasq (с БОЕВЫМИ именами ipset);
@@ -23,6 +27,11 @@ VPN_SETS=""
 COMMIT_ROLLBACK_FAILED=0
 DNSMASQ_RESTARTED=0
 NETFILTER_APPLIED=0
+SNAPSHOT_READY=0
+TRANSACTION_DONE=0
+KEEP_ROLLBACK=0
+DNS_HEALTH_LOG="${DNS_HEALTH_LOG:-$(sed -n -e "s/^[[:space:]]*dns_health_log[[:space:]]*=[[:space:]]*'\([^']*\)'.*/\1/p" -e 's/^[[:space:]]*dns_health_log[[:space:]]*=[[:space:]]*"\([^"\]*\)".*/\1/p' /opt/etc/bot/bot_config.py 2>/dev/null | head -n1)}"
+DNS_HEALTH_LOG="${DNS_HEALTH_LOG:-/opt/var/log/unblock_dns_health.log}"
 
 write_status() {
     _st="$1"
@@ -35,15 +44,24 @@ write_status() {
 
 cleanup() {
     _rc=$?
+    # set -e and TERM must not leave a partially applied transaction.
+    if [ "$SNAPSHOT_READY" -eq 1 ] && [ "$TRANSACTION_DONE" -eq 0 ] && [ "$_rc" -ne 0 ]; then
+        rollback_update "interrupted or unexpected failure" || true
+    fi
     rm -f "$TMP_STATUS"
-    [ -n "$ROLLBACK_DIR" ] && rm -rf "$ROLLBACK_DIR"
+    if [ -n "$ROLLBACK_DIR" ] && [ "$KEEP_ROLLBACK" -eq 0 ]; then
+        rm -rf "$ROLLBACK_DIR"
+    fi
     # Чужой lock снимать нельзя.
     if [ "$LOCK_ACQUIRED" -eq 1 ]; then
         rm -rf "$SCRIPT_LOCK"
     fi
     return "$_rc"
 }
-trap cleanup EXIT INT TERM HUP
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 
 snapshot_file() {
@@ -86,6 +104,13 @@ rollback_runtime_files() {
     restore_file /opt/etc/unblock.dnsmasq unblock.dnsmasq || _rrf_ok=0
     restore_file /opt/etc/unblock.dnsmasq.cidr unblock.dnsmasq.cidr || _rrf_ok=0
     restore_file /opt/etc/hosts hosts || _rrf_ok=0
+    restore_file "$DNS_HEALTH_LOG" dns_health.log || _rrf_ok=0
+    # DNS generation also changes this live set before the ordinary swaps.
+    ipset create unblockdns hash:net family inet hashsize 1024 maxelem 65536 -exist 2>/dev/null || _rrf_ok=0
+    ipset flush unblockdns 2>/dev/null || _rrf_ok=0
+    if [ -s "$ROLLBACK_DIR/unblockdns.save" ]; then
+        ipset restore -exist < "$ROLLBACK_DIR/unblockdns.save" 2>/dev/null || _rrf_ok=0
+    fi
     [ "$_rrf_ok" -eq 1 ]
 }
 discard_staging() {
@@ -103,7 +128,7 @@ reapply_runtime_after_rollback() {
     fi
     if [ "$NETFILTER_APPLIED" -eq 1 ] \
         && [ -x /opt/etc/ndm/netfilter.d/100-redirect.sh ]; then
-        for _rar_table in nat mangle filter; do
+        for _rar_table in nat filter; do
             if ! type=iptable table="$_rar_table" \
                 /opt/etc/ndm/netfilter.d/100-redirect.sh >/dev/null 2>&1; then
                 _rar_ok=0
@@ -113,9 +138,11 @@ reapply_runtime_after_rollback() {
     [ "$_rar_ok" -eq 1 ]
 }
 
-fail_update() {
+rollback_update() {
     _fu_msg="$1"
+    TRANSACTION_DONE=1
     _fu_ok=1
+    [ "$COMMIT_ROLLBACK_FAILED" -eq 0 ] || _fu_ok=0
     if [ -n "$COMMITTED_SETS" ]; then
         rollback_committed_sets || _fu_ok=0
     fi
@@ -125,8 +152,14 @@ fail_update() {
         discard_staging
         write_status "error" "$_fu_msg"
     else
+        KEEP_ROLLBACK=1
         write_status "rollback_failed" "$_fu_msg"
     fi
+    return 0
+}
+
+fail_update() {
+    rollback_update "$1"
     exit 1
 }
 
@@ -188,6 +221,16 @@ snapshot_file /opt/etc/dnsmasq.conf dnsmasq.conf || { write_status "error" "snap
 snapshot_file /opt/etc/unblock.dnsmasq unblock.dnsmasq || { write_status "error" "snapshot unblock.dnsmasq"; exit 1; }
 snapshot_file /opt/etc/unblock.dnsmasq.cidr unblock.dnsmasq.cidr || { write_status "error" "snapshot unblock.dnsmasq.cidr"; exit 1; }
 snapshot_file /opt/etc/hosts hosts || { write_status "error" "snapshot hosts"; exit 1; }
+snapshot_file "$DNS_HEALTH_LOG" dns_health.log || { write_status "error" "snapshot DNS health"; exit 1; }
+if ipset list -n unblockdns >/dev/null 2>&1; then
+    ipset save unblockdns > "$ROLLBACK_DIR/unblockdns.save" || { write_status "error" "snapshot unblockdns"; exit 1; }
+fi
+SNAPSHOT_READY=1
+# The DNS generator can apply netfilter before ipset commits.
+NETFILTER_APPLIED=1
+# The DNS child now (and previously) reloads the daemon itself. A failure in
+# generation/static fill must restore runtime DNS too, not only disk files.
+DNSMASQ_RESTARTED=1
 
 # До генерации dnsmasq удаляем оставшееся от старых версий состояние
 # запрещённых WAN/Bridge VPN-интерфейсов. Проверка policy table выполняется
@@ -337,7 +380,9 @@ check_list_overlap || true
 # Прежняя версия запускала генератор с IPSET_SUFFIX="_new", и после swap
 # наборы *_new уничтожались — dnsmasq пытался писать в несуществующие ipset
 # и все новые домены переставали попадать в обход до следующего перезапуска.
-if ! KEENZOO_STAGE_CIDR=1 IPSET_SUFFIX="" /opt/bin/unblock_dnsmasq.sh; then
+DNS_STAGE_LOG="$ROLLBACK_DIR/dns-candidate.log"
+if ! DNS_HEALTH_LOG="$DNS_STAGE_LOG" KEENZOO_DNS_STAGE=1 \
+    KEENZOO_STAGE_CIDR=1 IPSET_SUFFIX="" /opt/bin/unblock_dnsmasq.sh; then
     fail_update "dnsmasq gen"
 fi
 
@@ -352,7 +397,7 @@ fi
 # Сначала обрабатываются только обязательные статические списки. VPN-файлы
 # не входят в эту транзакцию: ошибка optional VPN не должна отменять commit
 # bot.txt/vless.txt.
-if ! KEENZOO_USE_DNS_SNAPSHOT=1 SKIP_VPN=1 IPSET_SUFFIX="_new" \
+if ! DNS_HEALTH_LOG="$DNS_STAGE_LOG" KEENZOO_USE_DNS_SNAPSHOT=1 SKIP_VPN=1 IPSET_SUFFIX="_new" \
     /opt/bin/unblock_ipset.sh; then
     fail_update "static ipset fill"
 fi
@@ -514,7 +559,7 @@ done
 OPTIONAL_VPN_FAILED=""
 for s in $VPN_SETS; do
     upd_selected "$s" || continue
-    if ONLY_SETS="$s" OPTIONAL_VPN=1 IPSET_SUFFIX="_new" \
+    if DNS_HEALTH_LOG="$DNS_STAGE_LOG" ONLY_SETS="$s" OPTIONAL_VPN=1 IPSET_SUFFIX="_new" \
         /opt/bin/unblock_ipset.sh; then
         if commit_set "$s"; then
             COMMITTED_SETS="${COMMITTED_SETS}${COMMITTED_SETS:+ }$s"
@@ -538,11 +583,11 @@ done
 if [ ! -x /opt/etc/init.d/S56dnsmasq ]; then
     fail_update "dnsmasq init missing"
 fi
+DNSMASQ_RESTARTED=1
 if ! /opt/etc/init.d/S56dnsmasq restart >/dev/null 2>&1; then
     logger -t "unblock_update" "dnsmasq restart failed" || true
     fail_update "dnsmasq restart"
 fi
-DNSMASQ_RESTARTED=1
 if command -v pidof >/dev/null 2>&1 \
     && ! pidof dnsmasq >/dev/null 2>&1; then
     logger -t "unblock_update" "dnsmasq is not running after restart" || true
@@ -550,13 +595,10 @@ if command -v pidof >/dev/null 2>&1 \
 fi
 
 if [ -x /opt/etc/ndm/netfilter.d/100-redirect.sh ]; then
-    if ! type=iptable table=nat /opt/etc/ndm/netfilter.d/100-redirect.sh >/dev/null 2>&1; then
+    if ! DNS_HEALTH_LOG="$DNS_STAGE_LOG" type=iptable table=nat /opt/etc/ndm/netfilter.d/100-redirect.sh >/dev/null 2>&1; then
         fail_update "netfilter nat"
     fi
     NETFILTER_APPLIED=1
-    if ! type=iptable table=mangle /opt/etc/ndm/netfilter.d/100-redirect.sh >/dev/null 2>&1; then
-        fail_update "netfilter mangle"
-    fi
 fi
 
 # Не объявляем update успешным, если обязательный ipset отсутствует после
@@ -572,6 +614,30 @@ for s in $STATIC_SETS; do
     logger -t "unblock_update" "validated required ipset: $s members=$_s_members"
 done
 
+# Only a real IPv4 answer through the committed config can publish success.
+_upd_domain="$(sed -n -e "s/^[[:space:]]*dns_health_domain[[:space:]]*=[[:space:]]*'\([^']*\)'.*/\1/p" \
+    -e 's/^[[:space:]]*dns_health_domain[[:space:]]*=[[:space:]]*"\([^"\]*\)".*/\1/p' \
+    /opt/etc/bot/bot_config.py 2>/dev/null | head -n1)"
+_upd_domain="${_upd_domain:-example.com}"
+if ! dig -4 +short +time=3 +tries=2 "$_upd_domain" A @127.0.0.1 -p 53 2>/dev/null \
+    | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    fail_update "dnsmasq client query"
+fi
+_upd_final="$(grep 'decision=final ' "$DNS_STAGE_LOG" 2>/dev/null | tail -1 || true)"
+case "$_upd_final" in
+    *' mode=TUNNEL_DNS '*|*' mode=LOCAL_DNSSEC '*|*' mode=DNS_OK_NO_DNSSEC '*) ;;
+    *) fail_update "DNS candidate missing or invalid" ;;
+esac
+_upd_final="$(printf '%s\n' "$_upd_final" | sed 's/ client=staged/ client=ok/')"
+mkdir -p "$(dirname "$DNS_HEALTH_LOG")"
+# Bounded copy + atomic promotion: readers see either old or committed data.
+tail -c 65536 "$DNS_HEALTH_LOG" 2>/dev/null | tail -n 198 > "$ROLLBACK_DIR/dns-publish" || :
+printf '\n%s\n' "$_upd_final" >> "$ROLLBACK_DIR/dns-publish"
+cp "$ROLLBACK_DIR/dns-publish" "${DNS_HEALTH_LOG}.commit.$$" \
+    && mv -f "${DNS_HEALTH_LOG}.commit.$$" "$DNS_HEALTH_LOG" \
+    || fail_update "DNS snapshot publish"
+
+TRANSACTION_DONE=1
 discard_staging
 
 if [ -n "$OPTIONAL_VPN_FAILED" ]; then

@@ -46,7 +46,10 @@ cleanup_lock() {
         rm -rf "$LOG_LOCK_DIR"
     fi
 }
-trap cleanup_lock EXIT INT TERM HUP
+trap cleanup_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 rotate() {
     _log="$1"
@@ -104,6 +107,7 @@ MAX=65536 KEEP=200 rotate /opt/var/log/trojan.log
 rotate /tmp/unblock_update.log
 # Compact DNS health rankings: at most 131072 bytes and 200 records.
 MAX=131072 KEEP=200 rotate /opt/var/log/unblock_dns_health.log
+MAX=65536 KEEP=200 rotate /opt/var/log/unblock_dns_v4.log
 # Вывод обновления бинарников/протоколов также пишется в /tmp и
 # перезаписывается при каждом запуске, но ограничиваем его и между
 # запусками: зависший или очень подробный update не должен занять ОЗУ.

@@ -142,8 +142,8 @@ bin_info() {
     echo "entware_arch=$(opkg print-architecture 2>/dev/null \
         | awk '$1=="arch" && $2!="all" && $2!="noarch" {print $2; exit}' \
         || echo N/A)"
-    echo "endian=$(od -An -tu1 -j5 -N1 /bin/busybox 2>/dev/null \
-        | tr -d ' ' \
+    echo "endian=$(dd if=/bin/busybox bs=1 skip=5 count=1 2>/dev/null \
+        | od -b | awk 'NR==1 {print $2+0}' \
         | awk '{if($1==1) print "little"; else if($1==2) print "big"; else print "unknown"}')"
     echo "kernel=$KERNEL"
     echo "libc=$(readlink -f /opt/lib/ld-*.so 2>/dev/null | head -1 || echo N/A)"

@@ -1,4 +1,8 @@
 #!/bin/sh
+# remove leaves init files for backup; block future starts, not stop/status.
+if [ -f /opt/etc/unblock/.disabled ]; then
+    case "${1:-start}" in start|restart|reconfigure|reload) exit 0 ;; esac
+fi
 
 BOT_DIR="/opt/etc/bot"
 MAIN_SCRIPT="$BOT_DIR/main.py"

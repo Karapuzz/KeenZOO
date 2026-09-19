@@ -1,4 +1,8 @@
 #!/bin/sh
+# remove keeps data but disables cron/NDM reactivation until next install.
+if [ -f /opt/etc/unblock/.disabled ] && [ "${PURGE_PROJECT:-0}" != 1 ]; then
+    exit 0
+fi
 # /opt/etc/ndm/ifstatechanged.d/100-unblock-vpn.sh
 # Реакция на изменение состояния интерфейсов прошивки.
 #   Клиентский VPN (выход в интернет через туннель) -> таблица маршрутизации,
@@ -61,7 +65,7 @@ is_forbidden_interface() {
     case "$1" in
         GigabitEthernet*|Ethernet*|Bridge*|ISP|Home|Guest|WifiMaster*|\
         WifiStation*|AccessPoint*|Mobile*|Cellular*|LTE*|Lte*|\
-        Usb*|UsbModem*|CdcEthernet*|Qmi*|Mbim*|Modem*|Pppoe*) return 0 ;;
+        Usb*|CdcEthernet*|Qmi*|Mbim*|Modem*|Pppoe*) return 0 ;;
     esac
     return 1
 }
@@ -520,7 +524,7 @@ wd_tunnel_ready() {
 # process/listener is already usable, lower-priority protocols are not
 # started. If it fails to become ready, advance to the next protocol.
 wd_revive_tunnel_fallback() {
-    for _wd_proto in xray trojan hysteria; do
+    for _wd_proto in hysteria xray trojan; do
         wd_tunnel_ready "$_wd_proto" && {
             logger -t "$TAG" "WAN up: tunnel selected=$_wd_proto (process+listener ready)"
             WD_TUNNEL_SELECTED="$_wd_proto"
@@ -573,11 +577,14 @@ wd_netfilter_retry() {
 # The hook itself returns immediately, while a second WAN event cannot start a
 # concurrent service/netfilter/DNS refresh worker.
 (
-    trap 'rm -rf "$WD_LOCK" 2>/dev/null || true' EXIT INT TERM HUP
+    trap 'rm -rf "$WD_LOCK" 2>/dev/null || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
 
     WD_REVIVED=0
     WD_TUNNEL_SELECTED=""
-    # Strict fallback order: Xray/VLESS -> Trojan -> Hysteria. Do not
+    # Strict fallback order: Hysteria -> Xray/VLESS -> Trojan. Do not
     # independently revive all three on the same WAN event.
     wd_revive_tunnel_fallback || true
     wd_revive S65shadowsocks ss-redir
@@ -587,7 +594,7 @@ wd_netfilter_retry() {
         sleep 5
         _wd_rules_ok=1
         if [ -x /opt/etc/ndm/netfilter.d/100-redirect.sh ]; then
-            for _wd_table in nat mangle filter; do
+            for _wd_table in nat filter; do
                 if ! wd_netfilter_retry "$_wd_table"; then
                     _wd_rules_ok=0
                     logger -t "$TAG" "WAN up: netfilter table=$_wd_table failed"
@@ -598,7 +605,7 @@ wd_netfilter_retry() {
             # a partial rollback.
             if [ "$_wd_rules_ok" = "0" ]; then
                 _wd_rules_ok=1
-                for _wd_table in nat mangle filter; do
+                for _wd_table in nat filter; do
                     wd_netfilter_retry "$_wd_table" || _wd_rules_ok=0
                 done
             fi
@@ -608,6 +615,11 @@ wd_netfilter_retry() {
                 logger -t "$TAG" "WAN up: правила перехвата применены частично; rollback/defer"
             fi
         fi
+    fi
+
+    # One coalesced DNS event after WAN/route recovery; no minute cron.
+    if [ -x /opt/etc/init.d/S99unblock ]; then
+        /opt/etc/init.d/S99unblock dns-event >/dev/null 2>&1 || true
     fi
 
     # Give the channel and revived services time to settle before refreshing

@@ -12,6 +12,7 @@ import logging
 import shutil
 import shlex
 import subprocess
+import signal
 import time
 import hashlib
 import hmac
@@ -19,6 +20,12 @@ import html
 import re
 import glob
 import threading
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from contextlib import contextmanager
+from functools import wraps
+from typing import Dict, Tuple
 from urllib.parse import urlparse
 
 from flask import (
@@ -63,6 +70,8 @@ logging.basicConfig(level=logging.ERROR)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 app = Flask(__name__)
+# Bound input size before parsing forms/JSON on memory-constrained routers.
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
 # ── Единый источник настроек: bot_config.generator_settings ──────────────
 # Раньше панель дублировала пути и порты собственными константами, из-за
@@ -91,7 +100,8 @@ def _load_or_create_secret():
             st = os.stat(SECRET_FILE)
             if not os.path.isfile(SECRET_FILE):
                 raise OSError('secret path is not a regular file')
-            key = open(SECRET_FILE, 'r', encoding='utf-8').read().strip()
+            with open(SECRET_FILE, 'r', encoding='utf-8') as secret:
+                key = secret.read(4096).strip()
             if len(key) < 32:
                 raise OSError('secret file is too short')
             if st.st_mode & 0o077:
@@ -157,7 +167,7 @@ def validate_csrf(token):
             or not isinstance(token, str)):
         return False
     return hmac.compare_digest(
-        token, expected)
+        token.encode('utf-8'), expected.encode('utf-8'))
 
 
 LAN_IP = _GS.get('listen_ip', getattr(config, 'routerip', '192.168.1.1'))
@@ -170,7 +180,7 @@ UNBLOCK_TIMEOUT = int(_GS.get('unblock_timeout', 300))
 # Учёт неудачных входов: {ip: (число_неудач, заблокирован_до)}.
 # Хранится в памяти процесса — перезапуск панели сбрасывает счётчики,
 # что приемлемо: панель доступна только из LAN.
-_auth_fails = {}
+_auth_fails: Dict[str, Tuple[int, float]] = {}
 _AUTH_MAX_FAILS = 5
 _AUTH_BLOCK_SEC = 300
 
@@ -255,10 +265,10 @@ def rotate_log():
                 GENERATOR_LOG) > 524288:
             with open(GENERATOR_LOG, 'r',
                       encoding='utf-8') as f:
-                lines = f.readlines()
+                lines = deque(f, maxlen=50)
             with open(GENERATOR_LOG, 'w',
                       encoding='utf-8') as f:
-                f.writelines(lines[-50:])
+                f.writelines(lines)
     except Exception:
         pass
 
@@ -360,8 +370,7 @@ def security_checks():
     # себя, а злоумышленник из LAN легко устраивает отказ в
     # обслуживании, просто перебирая пароль с чужого адреса.
     if ok:
-        if client in _auth_fails:
-            del _auth_fails[client]
+        _auth_fails.pop(client, None)
     else:
         if blocked_until > now:
             # Пауза уже идёт: не наращиваем счётчик, просто отказываем.
@@ -435,22 +444,53 @@ def _run_command(args, timeout=30, env=None, check=False, label='command'):
     hung child to hang the web worker forever.
     """
     try:
-        result = subprocess.run(
-            list(args),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env)
-    except subprocess.TimeoutExpired:
-        log_error(f'[!] {label}: timeout after {timeout}s')
-        result = subprocess.CompletedProcess(
-            args=args, returncode=124, stdout='', stderr='timeout')
+        # Spool stdout/stderr rather than holding arbitrarily large command
+        # output in Python RAM. Only bounded diagnostics/data are read back.
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen(list(args), stdout=out, stderr=err,
+                                    stdin=subprocess.DEVNULL, env=env,
+                                    start_new_session=True)
+            timed_out = False
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                # Give ash EXIT traps a chance to restore state; then ensure
+                # grandchildren cannot continue modifying rules after rollback.
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+            size = out.tell()
+            out.seek(0)
+            stdout = out.read(1024 * 1024).decode('utf-8', 'replace') if size <= 1024 * 1024 else ''
+            err.seek(max(0, err.tell() - 4000))
+            stderr = err.read(4000).decode('utf-8', 'replace')
+            rc = proc.returncode
+            if timed_out:
+                rc, stderr = 124, 'timeout'
+            elif size > 1024 * 1024:
+                rc, stderr = 125, 'command output exceeds 1 MiB'
+            result = subprocess.CompletedProcess(args, rc, stdout, stderr)
     except OSError as err:
         log_error(f'[!] {label}: {err}')
         result = subprocess.CompletedProcess(
             args=args, returncode=127, stdout='', stderr=str(err))
 
-    result.stdout = (result.stdout or '')[-4000:]
+    result.stdout = result.stdout or ''
+    if len(result.stdout) > 1024 * 1024:
+        result.stdout = ''
+        result.stderr = 'command output exceeds 1 MiB'
+        result.returncode = 125
     result.stderr = (result.stderr or '')[-4000:]
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[-400:]
@@ -642,10 +682,10 @@ TAB_TO_SERVICE = {
 
 
 def _read_enabled(sn):
-    """Читает ENABLED= из init-скрипта. Нет файла — считаем включённым."""
+    """Читает ENABLED= из init-скрипта. Нет файла/состояния — считаем выключенным."""
     sc = SERVICE_SCRIPTS.get(sn)
     if not sc or not os.path.exists(sc):
-        return True
+        return False
     try:
         with open(sc, 'r', encoding='utf-8',
                   errors='replace') as f:
@@ -656,7 +696,7 @@ def _read_enabled(sn):
                     return m.group(1).lower() == 'yes'
     except OSError:
         pass
-    return True
+    return False
 
 
 def get_services_enabled():
@@ -775,7 +815,7 @@ def _reapply_netfilter():
     if not os.path.exists(hook):
         return True
     ok = True
-    for table in ('nat', 'mangle', 'filter'):
+    for table in ('nat', 'filter'):
         env = dict(os.environ,
                    type='iptable', table=table)
         result = None
@@ -873,6 +913,40 @@ def _acquire_launcher_lock(path):
 
 def _release_launcher_lock(path):
     shutil.rmtree(path, ignore_errors=True)
+
+
+_update_thread_lock = threading.RLock()
+_update_depth = threading.local()
+
+
+@contextmanager
+def shared_update_lock():
+    if not _update_thread_lock.acquire(blocking=False):
+        raise RuntimeError('Изменение уже выполняется; повторите позже')
+    owner = False
+    try:
+        depth = getattr(_update_depth, 'value', 0)
+        if not depth:
+            if not _acquire_launcher_lock(LOCK_DIR):
+                raise RuntimeError('DNS/ipset/netfilter заняты; повторите позже')
+            owner = True
+        _update_depth.value = depth + 1
+        try:
+            yield
+        finally:
+            _update_depth.value = depth
+    finally:
+        if owner:
+            _release_launcher_lock(LOCK_DIR)
+        _update_thread_lock.release()
+
+
+def with_update_lock(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with shared_update_lock():
+            return func(*args, **kwargs)
+    return wrapped
 
 
 def _write_update_status(
@@ -1055,6 +1129,12 @@ def _netfilter_health():
     policy = _run_command(
         ['ip', '-4', 'rule', 'show'],
         timeout=5, label='policy routing health')
+    routes = _run_command(
+        ['ip', '-4', 'route', 'show', 'table', '100'],
+        timeout=5, label='TPROXY local route')
+    has_route = routes.returncode == 0 and bool(re.search(
+        r'(?m)^local\s+(?:default|0\.0\.0\.0/0)\s+dev\s+lo(?:\s|$)',
+        routes.stdout or ''))
     required = any(
         _service_ready(name)
         for name in ('vless', 'hysteria'))
@@ -1063,17 +1143,32 @@ def _netfilter_health():
         r'(?m)^.*(?:priority\s+1770|1770).*lookup\s+100',
         policy.stdout or ''))
     ok = rules.returncode == 0 and policy.returncode == 0 \
-        and (not required or (has_tproxy and has_policy))
+        and (not required or (has_tproxy and has_policy and has_route))
     return {
         'ok': ok,
         'state': 'ready' if ok else 'degraded',
         'tproxy_required': required,
         'tproxy_rules': has_tproxy,
         'policy_rule': has_policy,
+        'local_route': has_route,
+        'scope': 'rule-presence; not an end-to-end packet test',
     }
 
 
 def read_dns_decision():
+    from utils import v4_status
+    if getattr(config, 'dns_policy_version', 4) == 4:
+        current = v4_status()
+        mode = current.get('mode', 'DNS_UNAVAILABLE')
+        state = {'LOCAL_DNSSEC': 'DNSSEC_OK', 'TUNNEL_DNS': 'TUNNEL_DNS',
+                 'EMERGENCY_DNS': 'DNS_OK_NO_DNSSEC'}.get(mode, 'DNS_UNAVAILABLE')
+        metrics = current.get('metrics', {})
+        secure = [str(p) for p, m in metrics.items() if m.get('rtt') is not None]
+        return {'state': state, 'mode': mode, 'level': state,
+                'epoch': current.get('epoch', 0), 'line_present': bool(current),
+                'working_ports': ['40512'] if state != 'DNS_UNAVAILABLE' else [],
+                'secure_ports': secure, 'insecure_ports': [],
+                'policy': current}
     """Read the canonical DNS owner state for display only.
 
     The bounded health log is already the snapshot consumed by
@@ -1115,10 +1210,14 @@ def read_dns_decision():
         state = ''
     if state == 'DNSSEC_OK' and fields.get('verified') != '0':
         state = ''
+    if state == 'TUNNEL_DNS' and fields.get('required') != '1':
+        state = ''
     if state == 'TUNNEL_DNS' and fields.get('verified') != '1':
         state = ''
     if state == 'TUNNEL_DNS' \
             and fields.get('tunnel') not in ('xray', 'trojan', 'hysteria'):
+        state = ''
+    if fields.get('client') == 'staged':
         state = ''
     epoch = int(fields['epoch']) if fields.get('epoch', '').isdigit() else 0
     if not epoch or time.time() < epoch \
@@ -1199,6 +1298,112 @@ def _snapshot_port_result(port, decision):
     }
 
 
+
+# Short-lived observations are deliberately separate from the canonical owner
+# decision. GET never probes DNS or applies config. At most one bounded batch
+# runs per panel process, with three concurrent local dig children.
+_dns_probe_guard = threading.Lock()
+_dns_observation = {'status': 'idle', 'checked_at': 0, 'ports': {}}
+
+
+def _dns_config_stamp():
+    values = []
+    for path in (config.paths.get('dnsmasq_conf', '/opt/etc/dnsmasq.conf'),
+                 DNS_HEALTH_LOG):
+        try:
+            st = os.stat(path)
+            values.append((st.st_ino, st.st_size, st.st_mtime_ns))
+        except OSError:
+            values.append(None)
+    return tuple(values)
+
+
+def _dns_probe_port(port):
+    started = time.monotonic()
+    result = _run_command(
+        ['dig', '-4', '+dnssec', '+noall', '+comments', '+answer', '+stats',
+         '+time=2', '+tries=2', '-q', DNS_HEALTH_DOMAIN, '-t', 'A',
+         '@127.0.0.1', '-p', str(port)], timeout=6, label='DNS observation')
+    text = result.stdout or ''
+    code = re.search(r'status:\s*([A-Z0-9]+)', text)
+    flags = re.search(r'flags:\s*([^;]+)', text)
+    rcode = code.group(1) if code else None
+    bits = flags.group(1).split() if flags else []
+    addresses = []
+    for addr in re.findall(r'(?m)^[^;\s]\S*\s+\d+\s+IN\s+A\s+(\S+)', text):
+        try:
+            addresses.append(str(ipaddress.IPv4Address(addr)))
+        except ValueError:
+            pass
+    ok = result.returncode == 0 and rcode == 'NOERROR' and bool(addresses)
+    if result.returncode in (125, 126, 127):
+        state = 'probe-error'
+    elif result.returncode in (9, 124):
+        state = 'timeout'
+    elif ok:
+        state = 'dnssec-ok' if 'ad' in bits else 'dns-ok-no-dnssec'
+    else:
+        state = 'dns-failed'
+    return {'ok': ok, 'state': state, 'rcode': rcode,
+            'ad': 'ad' in bits, 'addresses': addresses[:16],
+            'elapsed_ms': round((time.monotonic() - started) * 1000),
+            'checked_at': int(time.time()), 'command_rc': result.returncode,
+            'source': 'live-query', 'transport': 'IPv4 UDP to local listener'}
+
+
+def _read_dns_observation():
+    with _dns_probe_guard:
+        data = dict(_dns_observation)
+    checked = data.get('checked_at', 0)
+    age = int(time.time()) - checked if checked else None
+    data['age_seconds'] = age
+    data['stale'] = (age is None or age < 0 or age > 60
+                     or data.get('config_stamp') != _dns_config_stamp())
+    return data
+
+
+def _start_dns_probe():
+    global _dns_observation
+    with _dns_probe_guard:
+        if _dns_observation.get('status') == 'running':
+            return False
+        stamp = _dns_config_stamp()
+        age = time.time() - _dns_observation.get('checked_at', 0)
+        if (0 <= age < 15 and _dns_observation.get('status') == 'done'
+                and _dns_observation.get('config_stamp') == stamp):
+            return False
+        _dns_observation = {'status': 'running', 'checked_at': 0, 'ports': {}}
+
+    def worker():
+        global _dns_observation
+        try:
+            ports = sorted({53} | {int(p) for p in DNS_PORTS_DOT + DNS_PORTS_DOH
+                                   if str(p).isdigit() and 1 <= int(p) <= 65535})
+            if len(ports) > 17:
+                raise ValueError('too many configured DNS ports')
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix='dns-probe') as pool:
+                results = dict(zip(map(str, ports), pool.map(_dns_probe_port, ports)))
+            data = {'status': 'done', 'checked_at': int(time.time()),
+                    'domain': DNS_HEALTH_DOMAIN, 'ports': results,
+                    'config_stamp': stamp}
+            if stamp != _dns_config_stamp():
+                data = {'status': 'error', 'checked_at': 0, 'ports': {},
+                        'message': 'Конфигурация DNS изменялась; повторите проверку'}
+        except Exception:
+            logging.exception('DNS observation failed')
+            data = {'status': 'error', 'checked_at': 0, 'ports': {},
+                    'message': 'Не удалось выполнить DNS-проверку'}
+        with _dns_probe_guard:
+            _dns_observation = data
+    try:
+        threading.Thread(target=worker, daemon=True, name='dns-observation').start()
+    except Exception:
+        with _dns_probe_guard:
+            _dns_observation = {'status': 'error', 'checked_at': 0, 'ports': {}}
+        raise
+    return True
+
+
 def check_dns_ports():
     decision = read_dns_decision()
     res = {
@@ -1220,7 +1425,23 @@ def check_dns_ports():
     }
     res['netfilter'] = _netfilter_health()
     res['pinned'] = read_pinned_hosts()
+    epoch = decision.get('epoch', 0)
+    res['snapshot'] = {
+        'epoch': epoch,
+        'age_seconds': int(time.time()) - epoch if epoch else None,
+        'is_live_measurement': False,
+    }
+    for kind in ('dot', 'doh'):
+        for info in res[kind].values():
+            info.update(source='snapshot', checked_at=epoch)
+    observation = _read_dns_observation()
+    observation.pop('config_stamp', None)
+    res['observation'] = observation
+    res['client_plane'] = dict(observation.get('ports', {}).get('53', {
+        'state': 'not-measured', 'ok': None, 'checked_at': 0}))
+    res['client_plane']['stale'] = observation['stale']
     res['decision'] = decision
+    res['policy_v4'] = decision.get('policy', {})
     res['dns_state'] = decision['state']
     res['netfilter_state'] = (
         'NETFILTER_DEGRADED'
@@ -1235,45 +1456,35 @@ def _clean_entry(entry):
 
 
 def _validate_cidr(entry):
-    m = re.match(
-        r'^(\d{1,3})\.(\d{1,3})\.'
-        r'(\d{1,3})\.(\d{1,3})'
-        r'/(\d{1,2})$', entry)
-    if not m:
+    try:
+        ipaddress.IPv4Network(entry, strict=False)
+        return '/' in entry
+    except ValueError:
         return False
-    o = [int(m.group(i))
-         for i in range(1, 5)]
-    p = int(m.group(5))
-    return (all(x <= 255 for x in o)
-            and 0 <= p <= 32)
 
 
 def _validate_ip(entry):
-    m = re.match(
-        r'^(\d{1,3})\.(\d{1,3})\.'
-        r'(\d{1,3})\.(\d{1,3})$', entry)
-    if not m:
+    try:
+        ipaddress.IPv4Address(entry)
+        return True
+    except ValueError:
         return False
-    return all(
-        int(m.group(i)) <= 255
-        for i in range(1, 5))
 
 
 def _validate_entry(ce):
     if '/' in ce:
-        return (('cidr', ce)
-                if _validate_cidr(ce)
-                else None)
+        return ('cidr', ce) if _validate_cidr(ce) else None
     if _validate_ip(ce):
         return ('ip', ce)
-    if ce.startswith('#'):
+    if re.fullmatch(r'[0-9.]+', ce):
         return None
-    if re.match(
-        r'^(\*\.)?[a-zA-Z0-9]'
-        r'([a-zA-Z0-9\-]*[a-zA-Z0-9])?'
-        r'(\.[a-zA-Z0-9]'
-        r'([a-zA-Z0-9\-]*'
-        r'[a-zA-Z0-9])?)*$', ce):
+    host = ce[2:] if ce.startswith('*.') else ce
+    if not host or len(host) > 253:
+        return None
+    labels = host.split('.')
+    if all(1 <= len(label) <= 63 and re.fullmatch(
+            r'[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?', label)
+           for label in labels):
         return ('domain', ce)
     return None
 
@@ -1288,22 +1499,25 @@ def read_file_text(fp):
 
 def _atomic_write_text(filepath, text):
     directory = os.path.dirname(filepath)
-    base = os.path.basename(filepath)
-    tmp = os.path.join(
-        directory,
-        f'.{base}.{os.getpid()}.tmp')
-
+    os.makedirs(directory, exist_ok=True)
+    mode = 0o644
     try:
-        with open(tmp, 'w', encoding='utf-8') as f:
+        mode = os.stat(filepath).st_mode & 0o777
+    except FileNotFoundError:
+        pass
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(filepath) + '.',
+                               suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            os.fchmod(f.fileno(), mode)
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, filepath)
     finally:
         try:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-        except Exception:
+            os.unlink(tmp)
+        except FileNotFoundError:
             pass
 
 
@@ -1513,6 +1727,7 @@ def _sort_key(entry):
     return (0, cl.lower().encode(), 0)
 
 
+@with_update_lock
 def parse_and_save(
         filepath, text,
         skip_global_dedup=False):
@@ -1702,7 +1917,7 @@ def _lookup_resource(query):
         if cidr_url:
             try:
                 r = _run_command(
-                    ['curl', '-s',
+                    ['curl', '-s', '--fail', '--max-filesize', '1048576',
                      '--max-time', '10',
                      cidr_url],
                     timeout=15,
@@ -1748,7 +1963,7 @@ def _lookup_resource(query):
         asn = q.upper()
         try:
             r = _run_command(
-                ['curl', '-s',
+                ['curl', '-s', '--fail', '--max-filesize', '1048576',
                  '--max-time', '15',
                  'https://stat.ripe.net'
                  '/data/announced-prefixes'
@@ -1993,388 +2208,54 @@ PAGE_TEMPLATE = r'''
 <meta name="viewport"
   content="width=device-width,
   initial-scale=1">
-<title>Генератор конфигураций</title>
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#10151e">
+<title>KeenZOO — панель управления</title>
+<script>try{var savedTheme=localStorage.getItem("keenzoo-theme");if(savedTheme==="light"||savedTheme==="dark")document.documentElement.dataset.theme=savedTheme;}catch(e){}</script>
 <style>
-/* Glassmorphism: полупрозрачные панели над мягким градиентом.
-   Градиент задан фиксированным слоем (background-attachment:fixed),
-   чтобы при прокрутке не пересчитывался — это заметно экономит
-   ресурсы на слабых клиентах. Размытие backdrop-filter применяется
-   только к крупным контейнерам, а не к каждому элементу. */
-:root{--txt:#eaf0ff;--muted:#93a2c9;
-  --accent:#4dd0ff;--accent2:#7c8cff;
-  --green:#3ddc97;--red:#ff6b7a;
-  --yellow:#ffc15a;--blue:#70a7ff;
-  --orange:#ffab5e;
-  --gl:rgba(255,255,255,.07);
-  --gl2:rgba(255,255,255,.12);
-  --brd:rgba(255,255,255,.16);
-  --shd:0 8px 32px rgba(0,0,0,.28);
-  /* Используется инлайн-стилем поля результатов поиска. */
-  --bg:rgba(0,0,0,.22)}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;
-  color:var(--txt);min-height:100vh;
-  background:#0b1020;
-  background-image:
-    radial-gradient(at 12% 18%,
-      rgba(80,90,255,.32) 0,transparent 45%),
-    radial-gradient(at 85% 12%,
-      rgba(0,200,255,.24) 0,transparent 45%),
-    radial-gradient(at 70% 88%,
-      rgba(160,80,255,.24) 0,transparent 45%);
-  background-attachment:fixed;
-  display:flex;flex-direction:column;
-  align-items:center;padding:1.2rem 1rem}
-h1{font-size:1.35rem;margin-bottom:1rem;
-  font-weight:600;letter-spacing:.3px;
-  color:var(--txt);text-align:center}
+:root{color-scheme:dark;--txt:#e9edf5;--muted:#a0acc0;--accent:#7de0c3;--accent2:#97b6ff;--green:#7de0b1;--red:#ff98a6;--yellow:#f0cc83;--orange:#f0bc85;--blue:#97b6ff;--page:#10151e;--surface:#181f2b;--gl:#202938;--gl2:#283449;--brd:#344055;--bg:#111923;--shd:0 8px 32px #00000012}
+:root[data-theme=light]{color-scheme:light;--txt:#18283a;--muted:#536479;--accent:#096e59;--accent2:#345eb0;--green:#167348;--red:#b92c43;--yellow:#845900;--orange:#8f4c0e;--blue:#345eb0;--page:#f1f4f8;--surface:#fff;--gl:#f4f7fa;--gl2:#e7edf4;--brd:#ccd6e2;--bg:#f8fafc;--shd:0 8px 32px #172f4b08}
+*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--txt);font:15px/1.55 system-ui,-apple-system,'Segoe UI',sans-serif;padding:0 32px 36px}button,input,textarea,select{font:inherit}button{cursor:pointer}button:disabled{opacity:.55;cursor:wait}button,a,input,textarea,select{-webkit-tap-highlight-color:transparent}a{color:var(--accent)}:focus-visible{outline:3px solid var(--accent2);outline-offset:4px}h1,h2,h3,p{margin:0}button,input,select{min-height:44px}textarea,input,select{max-width:100%;min-width:0}button{touch-action:manipulation}button,code,.hint,.msg,.dns-port,.dns-state,.netfilter-status{overflow-wrap:anywhere}svg{display:block}textarea{resize:vertical}input,textarea{scroll-margin-top:120px}button{transition:border-color .15s}
+.app-header{max-width:1440px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:100px;border-bottom:1px solid var(--brd)}.brand{display:flex;align-items:center;gap:12px}.brand-mark{display:grid;place-items:center;width:42px;height:42px;border:1px solid var(--accent);border-radius:14px;color:var(--accent);background:var(--gl)}.brand-name{font-size:21px;font-weight:750;letter-spacing:-.6px}.brand-sub{font-size:12px;color:var(--muted)}.header-tools{display:flex;align-items:center;gap:16px}.environment{font-size:12px;color:var(--muted);padding:7px 12px;border:1px solid var(--brd);border-radius:99px}.theme-toggle{display:flex;gap:8px;align-items:center;border:1px solid var(--brd);border-radius:12px;padding:8px 14px;color:var(--txt);background:var(--surface)}.theme-toggle:hover{background:var(--gl2)}.skip-link{position:absolute;top:-100px;left:16px;z-index:30;background:var(--surface);padding:12px}.skip-link:focus{top:10px}
+.page-intro{max-width:1440px;margin:32px auto 24px;display:flex;align-items:flex-end;justify-content:space-between;gap:24px}.eyebrow{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--accent);margin-bottom:8px}h1{font-size:clamp(25px,2.4vw,34px);font-weight:650;letter-spacing:-1px;line-height:1.2}.page-intro p{color:var(--muted);margin-top:10px;font-size:14px}.intro-note{color:var(--muted);font-size:12px;max-width:240px;text-align:right}.shell{max-width:1440px;display:grid;grid-template-columns:220px minmax(0,1fr);gap:28px;margin:auto;align-items:start}.tabs{position:sticky;top:20px;min-width:0;display:flex;flex-direction:column;gap:5px;padding:8px 0}.nav-label{font-size:10px;font-weight:750;letter-spacing:1.5px;color:var(--muted);padding:14px 14px 8px;text-transform:uppercase}.tab-btn{display:flex;align-items:center;gap:11px;border:1px solid transparent;border-radius:12px;background:transparent;color:var(--muted);padding:11px 13px;text-align:left;width:100%;font-size:14px;min-height:48px}.tab-btn:hover{background:var(--gl);color:var(--txt)}.tab-btn.active{color:var(--accent);background:var(--gl);border-color:var(--brd);font-weight:650}.nav-icon{display:inline-grid;place-items:center;flex:0 0 28px;height:28px;border:1px solid var(--brd);border-radius:8px;font:600 11px ui-monospace,monospace}.tab-btn.active .nav-icon{background:var(--accent);color:var(--page);border-color:var(--accent)}.nav-count{margin-left:auto;font:11px ui-monospace,monospace;color:var(--muted)}.nav-footer{color:var(--muted);font-size:11px;line-height:1.7;padding:22px 14px;border-top:1px solid var(--brd);margin-top:16px}.card{min-width:0;background:var(--surface);border:1px solid var(--brd);border-radius:20px;padding:28px;box-shadow:var(--shd)}.tab-content{display:none;min-width:0}.tab-content.active{display:block}.panel-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:24px}.panel-heading h2{font-size:23px;letter-spacing:-.5px;font-weight:650}.panel-heading p{font-size:13px;color:var(--muted);margin-top:5px}.section-tag{flex-shrink:0;color:var(--muted);font:11px ui-monospace,monospace;border:1px solid var(--brd);border-radius:8px;padding:6px 9px}.protocol-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:28px}.setup-column,.list-column{min-width:0}.list-column{border-left:1px solid var(--brd);padding-left:28px}.list-column>.divider{margin-top:0}.draft-indicator{display:none;margin-top:12px;color:var(--orange);font-size:12px}.draft-indicator.visible{display:block}.section-title{font-size:14px;font-weight:600}
+label{display:block;font-size:13px;color:var(--muted);margin-bottom:7px}textarea,input[type=text],select{display:block;width:100%;padding:12px 14px;color:var(--txt);background:var(--bg);border:1px solid var(--brd);border-radius:11px;font-size:16px;line-height:1.5}textarea{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:14px}textarea:focus,input:focus,select:focus{border-color:var(--accent)}textarea::placeholder,input::placeholder{color:var(--muted);opacity:.7}.key-area{min-height:106px}.list-area{min-height:350px;line-height:1.7;tab-size:2}.hint{font-size:12px;color:var(--muted);line-height:1.7;margin:9px 0 16px}.hint code{background:var(--gl2);border-radius:4px;padding:2px 5px;font-size:11px}.divider{border-top:1px solid var(--brd);margin:24px 0 16px;padding-top:16px;line-height:1.6}.divider span{font-size:12px;color:var(--muted);font-weight:600}.counter{color:var(--muted);font:11px/1.8 ui-monospace,monospace;text-align:right;margin-top:6px}.btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:44px;padding:11px 16px;border-radius:10px;border:1px solid var(--brd);background:var(--gl);color:var(--txt);font-size:13px;font-weight:650;line-height:1.5}.btn:hover{background:var(--gl2);border-color:var(--muted)}.btn-key,.btn-save{background:var(--accent);color:var(--page);border-color:var(--accent)}.btn-key:hover,.btn-save:hover{background:var(--accent);filter:brightness(.93);border-color:var(--accent)}.btn-save,.btn-cfg{margin-top:8px}.btn-cfg{color:var(--orange)}.btn.loading .btn-label{opacity:.7}.spinner-ring{display:none;width:16px;height:16px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite}.btn.loading .spinner-ring{display:inline-block}@keyframes spin{to{transform:rotate(360deg)}}
+.svc-row{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:14px 16px;background:var(--gl);border:1px solid var(--brd);border-radius:12px;margin-bottom:8px}.svc-name{font-size:13px;font-weight:650;overflow-wrap:anywhere}.svc-name.on{color:var(--green)}.svc-name.off{color:var(--muted)}.switch{position:relative;display:inline-block;flex:0 0 50px;width:50px;height:44px;margin:0}.switch input{position:absolute;inset:0;width:100%;height:100%;opacity:0;margin:0;cursor:pointer;z-index:1}.slider{position:absolute;inset:9px 0;border:1px solid var(--brd);border-radius:24px;background:var(--bg)}.slider:before{content:'';position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:var(--muted);transition:transform .18s}.switch input:checked+.slider{background:var(--accent);border-color:var(--accent)}.switch input:checked+.slider:before{transform:translateX(23px);background:var(--page)}.switch input:focus-visible+.slider{outline:3px solid var(--accent2);outline-offset:4px}.service-note{font-size:11px;color:var(--muted);margin:0 0 22px}
+.msg,#update-bar,#pin-bar{max-width:1440px;margin:12px auto;padding:13px 18px;border:1px solid var(--brd);border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;background:var(--surface)}.msg-ok,#update-bar.done,#pin-bar.ok{border-left:3px solid var(--green);color:var(--green)}.msg-err,#update-bar.error,#pin-bar.warn{border-left:3px solid var(--red);color:var(--red)}#update-bar,#pin-bar{display:none}#update-bar.running,#update-bar.done,#update-bar.error,#pin-bar.ok,#pin-bar.warn{display:block}#update-bar.running{color:var(--accent)}.info-box{background:var(--gl);border:1px solid var(--brd);border-left:3px solid var(--accent);border-radius:10px;padding:15px 18px;font-size:13px;line-height:1.8;color:var(--muted);margin-bottom:22px}.info-box b{color:var(--txt)}.lk-presets{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 18px}.lk-presets button{border:1px solid var(--brd);border-radius:99px;background:var(--surface);padding:8px 16px;color:var(--muted);font-size:13px}.lk-presets button:hover{border-color:var(--accent);color:var(--accent)}#lk-status{overflow-wrap:anywhere}#lk-output{min-height:260px!important}
+.dns-panel{min-width:0}.dns-toggle{display:none}.dns-grid,.ver-grid{display:none;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.dns-grid.open,.ver-grid.open{display:grid}.dns-label{grid-column:1/-1;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin:16px 0 2px}.dns-port,.dns-state,.netfilter-status{padding:14px;border:1px solid var(--brd);border-radius:11px;background:var(--bg);font:12px/1.7 ui-monospace,monospace;min-width:0}.dns-state,.netfilter-status{grid-column:1/-1}.dnssec,.dns-port.ok,.netfilter-status.ok{color:var(--green)}.no-dnssec{color:var(--yellow)}.tunnel{color:var(--blue)}.unavailable,.dns-port.fail{color:var(--red)}.checking{color:var(--muted)}.netfilter-status.degraded{color:var(--orange)}.dns-grid>.hint,#dns-v4-state{grid-column:1/-1;margin:0;overflow-wrap:anywhere;font-size:12px}#dns-v4-state{background:var(--gl);border:1px solid var(--brd);border-radius:10px;padding:14px!important;font-family:ui-monospace,monospace}.dns-grid>.btn{grid-column:span 2}.dns-legend{display:flex;flex-wrap:wrap;gap:8px;grid-column:1/-1;font:10px/1.6 ui-monospace,monospace}.dns-legend span{border:1px solid var(--brd);border-radius:6px;padding:5px 8px;overflow-wrap:anywhere}.pin-box{display:none;grid-column:1/-1;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);border:1px solid var(--brd);border-radius:10px;padding:14px;color:var(--muted);font:12px/1.8 ui-monospace,monospace}.pin-box.on{display:block}.ver-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.ver-item{min-width:0;padding:16px;background:var(--bg);border:1px solid var(--brd);border-radius:12px}.ver-item .dns-port{border:0;padding:0;min-height:55px;font-size:13px}.upd-btn{display:none;color:var(--accent)}.upd-btn.on,.upd-all-row.on{display:block}.upd-all-row{display:none;grid-column:1/-1}.upd-all-row .upd-btn{display:block}.upd-out{display:none;grid-column:1/-1;white-space:pre-wrap;overflow:auto;max-height:400px;overflow-wrap:anywhere;background:var(--bg);padding:18px;border:1px solid var(--brd);border-radius:12px;font:12px/1.8 ui-monospace,monospace}.upd-out.on{display:block}.panel-actions{display:flex;gap:12px;margin-bottom:20px}.panel-actions .btn{width:auto}.app-footer{max-width:1440px;margin:26px auto 0;display:flex;justify-content:space-between;gap:16px;color:var(--muted);font-size:11px}.app-footer span{overflow-wrap:anywhere}
+@media(min-width:1600px){body{padding-left:48px;padding-right:48px}}
+@media(max-width:1150px){.protocol-layout{grid-template-columns:minmax(0,1fr)}.list-column{border-left:0;padding-left:0;border-top:1px solid var(--brd);padding-top:24px}.list-column>.divider{border:0;padding:0}.shell{grid-template-columns:190px minmax(0,1fr);gap:20px}.card{padding:24px}.ver-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:900px){body{padding:0 20px 28px}.app-header{min-height:84px}.shell{display:block}.tabs{position:relative;top:0;display:flex;flex-direction:row;overflow-x:auto;gap:7px;padding:0 0 14px;margin-bottom:6px;scrollbar-width:thin;scroll-padding-inline:5px}.nav-label,.nav-footer,.nav-count{display:none}.tab-btn{flex:0 0 auto;width:auto;white-space:nowrap;padding:8px 12px;min-height:46px;border-color:var(--brd);background:var(--surface)}.nav-icon{flex-basis:24px;width:24px;height:24px;font-size:10px}.page-intro{margin:24px auto 20px}.intro-note{display:none}.card{padding:24px}.protocol-layout{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:22px}.list-column{border-top:0;border-left:1px solid var(--brd);padding:0 0 0 22px}.list-column>.divider{padding-top:0}.environment{display:none}}
+@media(max-width:640px){body{padding:0 14px 24px;padding-bottom:max(24px,env(safe-area-inset-bottom))}.app-header{min-height:78px}.brand-name{font-size:19px}.brand-sub{font-size:10px}.brand-mark{width:36px;height:36px;border-radius:11px}.theme-toggle{padding:8px 10px;font-size:12px}.header-tools{gap:6px}.page-intro{margin:22px auto 18px}.page-intro p{font-size:12px}.card{padding:18px;border-radius:15px}.panel-heading{gap:10px;margin-bottom:20px}.panel-heading h2{font-size:21px}.section-tag{font-size:10px;padding:5px 7px}.protocol-layout{grid-template-columns:minmax(0,1fr);gap:24px}.list-column{border:0;border-top:1px solid var(--brd);padding:20px 0 0}.list-area{min-height:280px}textarea{font-size:16px}.dns-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.dns-state,.netfilter-status,.dns-grid>.btn{grid-column:1/-1}.ver-grid{grid-template-columns:minmax(0,1fr)}.info-box{padding:12px;font-size:12px}.app-footer{flex-direction:column;gap:4px}.svc-row{padding:10px 12px}.panel-actions .btn{width:100%}.nav-icon{display:none}.tabs{margin-right:-2px}.tab-btn{font-size:13px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 
-/* ── Каркас: меню слева, настройки справа ── */
-.shell{display:flex;gap:1rem;width:100%;
-  max-width:1080px;align-items:flex-start}
-.tabs{display:flex;flex-direction:column;
-  gap:.4rem;width:190px;flex-shrink:0;
-  background:var(--gl);
-  border:1px solid var(--brd);
-  border-radius:16px;padding:.7rem;
-  backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);
-  box-shadow:var(--shd);
-  position:sticky;top:1rem}
-.tab-btn{padding:.6rem .8rem;
-  border:1px solid transparent;
-  border-radius:11px;background:transparent;
-  color:var(--muted);cursor:pointer;
-  font-size:.84rem;text-align:left;
-  width:100%;transition:.15s}
-.tab-btn:hover{background:var(--gl2);
-  color:var(--txt)}
-.tab-btn.active{background:var(--gl2);
-  border-color:var(--accent);
-  color:var(--accent);font-weight:600}
-.card{flex:1;min-width:0;
-  background:var(--gl);
-  border:1px solid var(--brd);
-  border-radius:16px;padding:1.4rem;
-  backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);
-  box-shadow:var(--shd)}
-.tab-content{display:none}
-.tab-content.active{display:block}
+</style></head><body>
 
-label{display:block;font-size:.78rem;
-  color:var(--muted);margin-bottom:.35rem}
-textarea,input[type=text]{width:100%;
-  padding:.65rem .85rem;
-  background:rgba(0,0,0,.22);
-  border:1px solid var(--brd);
-  border-radius:11px;color:var(--txt);
-  font-size:.85rem;
-  font-family:'Consolas',monospace;
-  resize:vertical;transition:.15s}
-textarea:focus,input:focus{outline:none;
-  border-color:var(--accent);
-  background:rgba(0,0,0,.3)}
-textarea::placeholder,input::placeholder{
-  color:#6b789b}
-.key-area{min-height:88px}
-.list-area{min-height:250px;line-height:1.5}
-.hint{font-size:.7rem;color:var(--muted);
-  margin:.3rem 0 .8rem;line-height:1.4}
-.hint code{background:rgba(0,0,0,.28);
-  padding:.1rem .35rem;border-radius:5px}
-.divider{height:1px;background:var(--brd);
-  margin:1.2rem 0;display:flex;
-  align-items:center;justify-content:center}
-.divider span{background:#131a30;
-  color:var(--accent);font-size:.76rem;
-  font-weight:600;padding:0 .8rem;
-  border-radius:8px}
+<a class="skip-link" href="#main-content">К настройкам</a>
+<header class="app-header">
+  <div class="brand"><span class="brand-mark" aria-hidden="true"><svg width="23" height="23" viewBox="0 0 24 24" fill="none"><path d="M5 4v16M19 4l-9 8 9 8M10 12H5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><div><div class="brand-name">KeenZOO</div><div class="brand-sub">Сеть под вашим контролем</div></div></div>
+  <div class="header-tools"><span class="environment">IPv4 · локальная панель</span><button type="button" class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" aria-label="Переключить цветовую тему"><span aria-hidden="true">◐</span><span id="theme-label">Светлая тема</span></button></div>
+</header>
+<section class="page-intro"><div><div class="eyebrow">Панель управления</div><h1>Подключения и маршруты</h1><p>Настройте протоколы, управляйте списками и проверяйте DNS.</p></div><div class="intro-note">Изменения применяются<br>только после вашего действия.</div></section>
 
-.btn{width:100%;padding:.65rem;
-  border:1px solid var(--brd);
-  border-radius:11px;background:var(--gl2);
-  color:var(--txt);font-size:.86rem;
-  font-weight:600;cursor:pointer;
-  transition:.15s;min-height:2.6rem;
-  display:flex;align-items:center;
-  justify-content:center;gap:.4rem}
-.btn:hover{background:rgba(255,255,255,.18)}
-.btn:active{transform:translateY(1px)}
-.btn:disabled{opacity:.5;
-  cursor:not-allowed;transform:none}
-.btn-key{border-color:rgba(77,208,255,.5);
-  color:var(--accent)}
-.btn-cfg{border-color:rgba(255,171,94,.5);
-  color:var(--orange);margin-top:.4rem}
-.btn-save{border-color:rgba(61,220,151,.5);
-  color:var(--green);margin-top:.4rem}
-.btn .spinner-ring{display:none;
-  width:1rem;height:1rem;
-  border:2px solid rgba(255,255,255,.25);
-  border-top-color:currentColor;
-  border-radius:50%;
-  animation:spin .6s linear infinite}
-.btn.loading .spinner-ring{
-  display:inline-block}
-.btn.loading .btn-label{opacity:.7}
-@keyframes spin{to{
-  transform:rotate(360deg)}}
-
-.msg{margin:.7rem auto;padding:.7rem 1rem;
-  border-radius:12px;font-size:.83rem;
-  max-width:1080px;width:100%;
-  background:var(--gl);
-  border:1px solid var(--brd);
-  backdrop-filter:blur(10px);
-  -webkit-backdrop-filter:blur(10px);
-  white-space:pre-line}
-.msg-ok{border-left:3px solid var(--green);
-  color:var(--green)}
-.msg-err{border-left:3px solid var(--red);
-  color:var(--red)}
-.counter{font-size:.7rem;color:var(--muted);
-  text-align:right;margin-top:.2rem}
-
-#update-bar{display:none;max-width:1080px;
-  width:100%;margin:.5rem auto;
-  padding:.65rem 1rem;border-radius:12px;
-  font-size:.83rem;text-align:center;
-  background:var(--gl);
-  border:1px solid var(--brd);
-  backdrop-filter:blur(10px);
-  -webkit-backdrop-filter:blur(10px)}
-#update-bar.running{display:block;
-  border-left:3px solid var(--accent);
-  color:var(--accent)}
-#update-bar.done{display:block;
-  border-left:3px solid var(--green);
-  color:var(--green)}
-#update-bar.error{display:block;
-  border-left:3px solid var(--red);
-  color:var(--red)}
-
-/* Доступность серверов обхода. Пишется unblock_dnsmasq.sh. */
-#pin-bar{display:none;max-width:1080px;
-  width:100%;margin:.5rem auto;
-  padding:.65rem 1rem;border-radius:12px;
-  font-size:.83rem;text-align:center;
-  white-space:pre-wrap;
-  background:var(--gl);
-  border:1px solid var(--brd);
-  backdrop-filter:blur(10px);
-  -webkit-backdrop-filter:blur(10px)}
-#pin-bar.warn{display:block;
-  border-left:3px solid var(--red);
-  color:var(--red)}
-#pin-bar.ok{display:block;
-  border-left:3px solid var(--green);
-  color:var(--green)}
-
-/* ── Переключатель протокола ── */
-.svc-row{display:flex;align-items:center;
-  justify-content:space-between;
-  background:rgba(0,0,0,.2);
-  border:1px solid var(--brd);
-  border-radius:12px;padding:.6rem .9rem;
-  margin-bottom:1.1rem}
-.svc-name{font-size:.82rem;font-weight:600;
-  color:var(--muted);margin-right:.6rem;
-  min-width:0;overflow-wrap:anywhere}
-.svc-name.on{color:var(--green)}
-.svc-name.off{color:var(--red)}
-.switch{position:relative;display:inline-block;
-  width:50px;height:26px;flex-shrink:0}
-.switch input{opacity:0;width:0;height:0}
-.slider{position:absolute;cursor:pointer;
-  inset:0;background:rgba(255,255,255,.12);
-  border:1px solid var(--brd);
-  border-radius:26px;transition:.2s}
-.slider:before{position:absolute;content:"";
-  height:18px;width:18px;left:3px;bottom:3px;
-  background:var(--muted);border-radius:50%;
-  transition:.2s}
-.switch input:checked+.slider{
-  background:rgba(61,220,151,.28);
-  border-color:var(--green)}
-.switch input:checked+.slider:before{
-  transform:translateX(23px);
-  background:var(--green)}
-
-/* ── Нижние панели ── */
-.dns-panel{max-width:1080px;width:100%;
-  margin-top:1rem}
-.dns-toggle{background:var(--gl);
-  border:1px solid var(--brd);
-  border-radius:12px;padding:.55rem .8rem;
-  color:var(--muted);font-size:.75rem;
-  cursor:pointer;width:100%;
-  text-align:center;transition:.15s;
-  backdrop-filter:blur(10px);
-  -webkit-backdrop-filter:blur(10px)}
-.dns-toggle:hover{color:var(--accent);
-  border-color:var(--accent)}
-.dns-grid{display:none;
-  grid-template-columns:repeat(4,1fr);
-  gap:.5rem;margin-top:.5rem;
-  background:var(--gl);
-  border:1px solid var(--brd);
-  border-radius:14px;padding:.85rem;
-  backdrop-filter:blur(10px);
-  -webkit-backdrop-filter:blur(10px)}
-.dns-grid.open{display:grid}
-.dns-port{text-align:center;padding:.35rem;
-  border-radius:9px;font-size:.72rem;
-  font-family:monospace;
-  background:rgba(0,0,0,.2);
-  border:1px solid var(--brd)}
-.dns-port.dnssec{color:var(--green);
-  border-color:rgba(61,220,151,.4)}
-.dns-port.no-dnssec{color:var(--yellow);
-  border-color:rgba(255,193,7,.45)}
-.dns-port.tunnel{color:var(--blue);
-  border-color:rgba(112,167,255,.5)}
-.dns-port.unavailable{color:var(--red);
-  border-color:rgba(255,107,122,.4)}
-.dns-port.checking{color:var(--muted)}
-.dns-state{grid-column:span 2;text-align:center;
-  padding:.5rem;border-radius:9px;font-size:.74rem;
-  font-family:ui-monospace,monospace;
-  background:rgba(0,0,0,.2);border:1px solid var(--brd)}
-.dns-state.dnssec{color:var(--green);
-  border-color:rgba(61,220,151,.4)}
-.dns-state.no-dnssec{color:var(--yellow);
-  border-color:rgba(255,193,7,.45)}
-.dns-state.tunnel{color:var(--blue);
-  border-color:rgba(112,167,255,.5)}
-.dns-state.unavailable{color:var(--red);
-  border-color:rgba(255,107,122,.4)}
-.netfilter-status{grid-column:span 2;text-align:center;
-  padding:.5rem;border-radius:9px;font-size:.68rem;
-  font-family:ui-monospace,monospace;background:rgba(0,0,0,.14);
-  border:1px dashed var(--brd);color:var(--muted)}
-.netfilter-status.ok{color:var(--green);
-  border-color:rgba(61,220,151,.35)}
-.netfilter-status.degraded{color:var(--orange);
-  border-color:rgba(255,171,94,.45)}
-.dns-legend{grid-column:1/-1;display:grid;
-  grid-template-columns:repeat(4,minmax(0,1fr));gap:.3rem;
-  font:600 .58rem ui-monospace,monospace;text-align:center}
-.dns-legend span{padding:.35rem .2rem;border:1px solid var(--brd);
-  border-radius:6px;color:var(--muted);overflow-wrap:anywhere}
-.dns-legend .dnssec{color:var(--green);border-color:rgba(61,220,151,.4)}
-.dns-legend .no-dnssec{color:var(--yellow);border-color:rgba(255,193,7,.45)}
-.dns-legend .tunnel{color:var(--blue);border-color:rgba(112,167,255,.5)}
-.dns-legend .unavailable{color:var(--red);border-color:rgba(255,107,122,.4)}
-.dns-label{font-size:.7rem;color:var(--muted);
-  margin:.4rem 0 .1rem;font-weight:600;
-  grid-column:1/-1;background:none;
-  border:none;text-align:left}
-.ver-grid{display:none;
-  grid-template-columns:1fr 1fr;gap:.5rem;
-  margin-top:.5rem;background:var(--gl);
-  border:1px solid var(--brd);
-  border-radius:14px;padding:.85rem;
-  backdrop-filter:blur(10px);
-  -webkit-backdrop-filter:blur(10px)}
-.ver-grid.open{display:grid}
-/* Ячейка протокола: строка версии, под ней — кнопка обновления,
-   которая показывается только при наличии обновления. */
-.ver-item{display:flex;flex-direction:column;
-  gap:.35rem}
-.upd-all-row{grid-column:1/-1;display:none}
-.upd-all-row.on{display:block}
-.upd-btn{display:none;width:100%;
-  font-size:.78rem;padding:.42rem .6rem;
-  border-color:rgba(255,171,94,.5);
-  color:var(--orange)}
-.upd-btn.on{display:block}
-.upd-all-row .upd-btn{display:block}
-.upd-out{display:none;white-space:pre-wrap;
-  font-family:ui-monospace,monospace;
-  font-size:.78rem;line-height:1.35;
-  max-height:15rem;overflow:auto;
-  padding:.6rem .7rem;border-radius:.5rem;
-  background:rgba(0,0,0,.28);
-  border:1px solid rgba(255,255,255,.12);
-  word-break:break-word}
-.upd-out.on{display:block}
-/* Закреплённые в /opt/etc/hosts адреса прокси-серверов. */
-.pin-box{display:none;grid-column:1/-1;
-  white-space:pre-wrap;
-  font-family:ui-monospace,monospace;
-  font-size:.74rem;line-height:1.5;
-  color:var(--muted);padding:.45rem .6rem;
-  border-radius:.5rem;
-  background:rgba(0,0,0,.22);
-  border:1px solid rgba(255,255,255,.1);
-  word-break:break-all}
-.pin-box.on{display:block}
-
-.info-box{background:rgba(255,171,94,.1);
-  border:1px solid rgba(255,171,94,.35);
-  border-radius:12px;padding:.8rem;
-  margin-bottom:1rem;font-size:.77rem;
-  line-height:1.5;color:var(--orange)}
-.info-box code{background:rgba(0,0,0,.3);
-  padding:.1rem .35rem;border-radius:5px}
-.lk-presets{display:flex;gap:.5rem;
-  flex-wrap:wrap;margin-bottom:.9rem}
-.lk-presets button{padding:.35rem .8rem;
-  border:1px solid var(--brd);
-  border-radius:10px;background:var(--gl2);
-  color:var(--muted);cursor:pointer;
-  font-size:.75rem;transition:.15s}
-.lk-presets button:hover{color:var(--accent);
-  border-color:var(--accent)}
-
-/* Узкий экран: меню становится горизонтальным */
-@media(max-width:760px){
-  .shell{flex-direction:column}
-  .tabs{width:100%;flex-direction:row;
-    flex-wrap:wrap;position:static}
-  .tab-btn{width:auto;flex:1 1 auto;
-    text-align:center}
-  /* В колонке flex:1 не растягивает по ширине — задаём явно,
-     иначе карточка занимала лишь часть экрана. */
-  .card{width:100%;padding:1rem}
-}</style></head><body>
-<h1>&#9881;&#65039;
-  Генератор конфигураций</h1>
-<div id="update-bar"></div>
-<div id="pin-bar"></div>
+<div id="update-bar" role="status" aria-live="polite"></div>
+<div id="pin-bar" role="status" aria-live="polite"></div>
 {% with msgs = get_flashed_messages(
   with_categories=true) %}
 {% if msgs %}{% for cat, msg in msgs %}
-<div class="msg {{ 'msg-ok'
+<div role="status" class="msg {{ 'msg-ok'
   if cat=='ok' else 'msg-err' }}">
   {{ msg }}</div>
 {% endfor %}{% endif %}{% endwith %}
 <div class="shell">
-<div class="tabs">
-  <button id="btn-ss" class="tab-btn
-    {% if active=='ss' %}active{% endif %}"
-    onclick="go('ss')">Shadowsocks</button>
-  <button id="btn-tr" class="tab-btn
-    {% if active=='tr' %}active{% endif %}"
-    onclick="go('tr')">Trojan</button>
-  <button id="btn-vl" class="tab-btn
-    {% if active=='vl' %}active{% endif %}"
-    onclick="go('vl')">VLESS</button>
-  <button id="btn-to" class="tab-btn
-    {% if active=='to' %}active{% endif %}"
-    onclick="go('to')">Tor</button>
-  <button id="btn-hy" class="tab-btn
-    {% if active=='hy' %}active{% endif %}"
-    onclick="go('hy')">Hysteria</button>
-  <button id="btn-bt" class="tab-btn
-    {% if active=='bt' %}active{% endif %}"
-    onclick="go('bt')">&#129302; Бот</button>
-  <button id="btn-lk" class="tab-btn
-    {% if active=='lk' %}active{% endif %}"
-    onclick="go('lk')">&#128269; Поиск</button>
-</div>
-<div class="card">
+<nav class="tabs" role="tablist" aria-label="Разделы панели" aria-orientation="vertical">
+<div class="nav-label" role="presentation">Подключения</div>
+{% for tid,label,icon in [('ss','Shadowsocks','SS'),('tr','Trojan','TR'),('vl','VLESS','VL'),('to','Tor','TO'),('hy','Hysteria','HY'),('bt','Трафик роутера','RT'),('lk','Поиск адресов','↗'),('dn','DNS и сеть','◎'),('up','Обновления','↑')] %}
+{% if tid=='bt' %}<div class="nav-label" role="presentation">Инструменты</div>{% endif %}
+<button type="button" id="btn-{{ tid }}" class="tab-btn {% if active==tid %}active{% endif %}" role="tab" aria-selected="{{ 'true' if active==tid else 'false' }}" aria-controls="tab-{{ tid }}" tabindex="{{ '0' if active==tid else '-1' }}" onclick="go('{{ tid }}')"><span class="nav-icon" aria-hidden="true">{{ icon }}</span><span>{{ label }}</span>{% if tid in list_counts %}<span class="nav-count" title="Записей в списке">{{ list_counts[tid] }}</span>{% endif %}</button>
+{% endfor %}
+<div class="nav-footer" role="presentation">KeenZOO UI 5<br>Без внешних шрифтов и CDN</div>
+</nav>
+<main class="card" id="main-content" tabindex="-1">
   {% for tid, tname, fkey in [
     ('ss','Shadowsocks','shadowsocks'),
     ('tr','Trojan','trojan'),
@@ -2383,7 +2264,9 @@ textarea::placeholder,input::placeholder{
     ('hy','Hysteria','hysteria')] %}
   <div id="tab-{{ tid }}"
     class="tab-content
-    {% if active==tid %}active{% endif %}">
+    {% if active==tid %}active{% endif %}" role="tabpanel" aria-labelledby="btn-{{ tid }}" tabindex="0">
+    <div class="panel-heading"><div><h2>{{ tname }}</h2><p>Подключение и правила выборочного обхода</p></div><span class="section-tag">{{ fkey }}.txt</span></div>
+    <div class="protocol-layout"><section class="setup-column" aria-label="Настройки подключения">
     <form method="post"
       action="{{ url_for('toggle_service',
         tab=tid) }}"
@@ -2399,10 +2282,10 @@ textarea::placeholder,input::placeholder{
           {{ 'on' if svc_enabled[tid]
             else 'off' }}">
           {{ '\u25cf' }} {{ tname }}:
-          {{ 'включён' if svc_enabled[tid]
+          {{ 'разрешён' if svc_enabled[tid]
             else 'отключён' }}</span>
         <label class="switch">
-          <input type="checkbox"
+          <input type="checkbox" role="switch" aria-label="Включить {{ tname }} в конфигурации"
             {% if svc_enabled[tid] %}checked{% endif %}
             onchange="document.getElementById(
               'tgl-{{ tid }}').submit()">
@@ -2410,6 +2293,7 @@ textarea::placeholder,input::placeholder{
         </label>
       </div>
     </form>
+    <p class="service-note">Переключатель отражает настройку автозапуска, а не проверку соединения.</p>
     {% if tid == 'to' %}
     <form method="post"
       action="{{ url_for('key_to') }}"
@@ -2421,25 +2305,25 @@ textarea::placeholder,input::placeholder{
         color:var(--accent);
         font-weight:600;
         margin-bottom:.4rem">
-        &#128274; obfs4</div>
-      <label>Мосты (по одному)</label>
-      <textarea name="obfs4_bridges"
+         obfs4</div>
+      <label for="obfs4_bridges">Мосты obfs4 (по одному)</label>
+      <textarea name="obfs4_bridges" id="obfs4_bridges" spellcheck="false"
         class="key-area"
         placeholder="obfs4 ..."></textarea>
       <div style="font-size:.88rem;
         color:var(--accent);
         font-weight:600;
         margin:.6rem 0 .4rem">
-        &#127760; Webtunnel</div>
-      <label>Мосты (по одному)</label>
-      <textarea name="webtunnel_bridges"
+         Webtunnel</div>
+      <label for="webtunnel_bridges">Мосты Webtunnel (по одному)</label>
+      <textarea name="webtunnel_bridges" id="webtunnel_bridges" spellcheck="false"
         class="key-area"
         placeholder="webtunnel ..."></textarea>
       <button type="submit"
         class="btn btn-key">
         <span class="spinner-ring"></span>
         <span class="btn-label">
-          &#128273; Применить</span>
+           Применить</span>
       </button>
     </form>
     {% else %}
@@ -2449,20 +2333,20 @@ textarea::placeholder,input::placeholder{
       <input type="hidden"
         name="csrf_token"
         value="{{ csrf_token }}">
-      <label>Ключ {{ tname }}</label>
-      <input type="text" name="key"
-        placeholder="Ключ {{ tname }}">
+      <label for="key-{{ tid }}">Ссылка подключения {{ tname }}</label>
+      <input type="text" name="key" id="key-{{ tid }}" autocomplete="off" autocapitalize="none" spellcheck="false"
+        placeholder="{{ {'ss':'ss://…','tr':'trojan://…','vl':'vless://…','hy':'hysteria2://…'}[tid] }}">
       <p class="hint">
-        Формат {{ tname }}</p>
+        Вставьте ссылку подключения. После применения сервис будет перезапущен.</p>
       <button type="submit"
         class="btn btn-key">
         <span class="spinner-ring"></span>
         <span class="btn-label">
-          &#128273; Применить ключ</span>
+           Применить ключ</span>
       </button>
     </form>
     <div class="divider">
-      <span>&#128196;
+      <span>
         или JSON-конфиг</span></div>
     <form method="post"
       action="{{ url_for('config_'+tid) }}"
@@ -2470,8 +2354,8 @@ textarea::placeholder,input::placeholder{
       <input type="hidden"
         name="csrf_token"
         value="{{ csrf_token }}">
-      <label>config.json</label>
-      <textarea name="config_data"
+      <label for="config-{{ tid }}">JSON-конфигурация</label>
+      <textarea name="config_data" id="config-{{ tid }}" spellcheck="false" autocapitalize="none"
         class="key-area"
         placeholder='{"outbounds":[...]}'
         style="min-height:120px"></textarea>
@@ -2482,12 +2366,13 @@ textarea::placeholder,input::placeholder{
         class="btn btn-cfg">
         <span class="spinner-ring"></span>
         <span class="btn-label">
-          &#128196; Применить конфиг</span>
+           Применить конфиг</span>
       </button>
     </form>
     {% endif %}
+    </section><section class="list-column" aria-label="Список обхода">
     <div class="divider">
-      <span>&#128195;
+      <span>
         {{ fkey }}.txt &mdash;
         {{ list_details[tid] }}</span>
     </div>
@@ -2497,9 +2382,8 @@ textarea::placeholder,input::placeholder{
       <input type="hidden"
         name="csrf_token"
         value="{{ csrf_token }}">
-      <label>Список
-        ({{ ipsets[tid] }})</label>
-      <textarea name="content"
+      <label for="ta-{{ tid }}">Домены, IP и сети · {{ ipsets[tid] }}</label>
+      <textarea name="content" spellcheck="false" autocapitalize="none"
         class="list-area"
         id="ta-{{ tid }}">{{ contents[tid] }}</textarea>
       <div class="counter"
@@ -2512,20 +2396,40 @@ textarea::placeholder,input::placeholder{
         class="btn btn-save">
         <span class="spinner-ring"></span>
         <span class="btn-label">
-          &#128190; Сохранить</span>
+           Сохранить</span>
       </button>
     </form>
+    </section></div>
   </div>
   {% endfor %}
   <div id="tab-bt" class="tab-content
-    {% if active=='bt' %}active{% endif %}">
+    {% if active=='bt' %}active{% endif %}" role="tabpanel" aria-labelledby="btn-bt" tabindex="0"><div class="panel-heading"><div><h2>Трафик роутера</h2><p>Отдельный маршрут для TCP-соединений самого роутера</p></div></div>
     <div class="info-box">
-      &#129302; <b>Обход роутера</b><br>
-      OUTPUT &rarr; xray :10810.<br>
-      &#9888;&#65039; Не IP VPS!<br>
-      &#128204; Совпадения ОК.</div>
+       <b>Обход роутера</b><br>
+      Только TCP OUTPUT для доменов/IP из bot.txt.<br>
+      DNS и UDP клиентов этим выбором не изменяются.<br>
+      Не добавляйте IP своего VPS в список.</div>
+    <form method="post" action="{{ url_for('route_router_protocol') }}"
+      onsubmit="return btnLock(this)">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label for="router-protocol">Протокол TCP для bot.txt</label>
+      <select id="router-protocol" name="protocol">
+        {% for key, item in router_protocols.items() %}
+        <option value="{{ key }}" {% if router_protocol==key %}selected{% endif %}>
+          {{ item[1] }}</option>
+        {% endfor %}
+      </select>
+      <p class="hint">Сначала настройте и включите протокол. Выбор сохраняется
+        после перезагрузки. При отключённом протоколе перехват снимается
+        (прямое соединение, без автоматической смены протокола).
+        Для доменного сервера Trojan необходим актуальный pin в hosts.</p>
+      <button type="submit" class="btn btn-save">
+        <span class="spinner-ring"></span>
+        <span class="btn-label">Применить протокол</span>
+      </button>
+    </form>
     <div class="divider">
-      <span>&#128195; bot.txt &mdash;
+      <span> bot.txt &mdash;
         {{ list_details.bt }}</span></div>
     <form method="post"
       action="{{ url_for('list_bt') }}"
@@ -2533,9 +2437,8 @@ textarea::placeholder,input::placeholder{
       <input type="hidden"
         name="csrf_token"
         value="{{ csrf_token }}">
-      <label>Список
-        ({{ ipsets.bt }})</label>
-      <textarea name="content"
+      <label for="ta-bt">Домены, IP и сети · {{ ipsets.bt }}</label>
+      <textarea name="content" spellcheck="false" autocapitalize="none"
         class="list-area"
         id="ta-bt">{{ contents.bt }}</textarea>
       <div class="counter"
@@ -2546,14 +2449,14 @@ textarea::placeholder,input::placeholder{
         class="btn btn-save">
         <span class="spinner-ring"></span>
         <span class="btn-label">
-          &#128190; Сохранить</span>
+           Сохранить</span>
       </button>
     </form>
   </div>
   <div id="tab-lk" class="tab-content
-    {% if active=='lk' %}active{% endif %}">
+    {% if active=='lk' %}active{% endif %}" role="tabpanel" aria-labelledby="btn-lk" tabindex="0"><div class="panel-heading"><div><h2>Поиск адресов</h2><p>Найдите домены, IP и сети для ваших списков</p></div></div>
     <div class="info-box">
-      &#128269; <b>Поиск IP и CIDR</b><br>
+       <b>Поиск IP и CIDR</b><br>
       Введите сайт, IP, AS-номер
       или выберите сервис.</div>
     <div class="lk-presets">
@@ -2566,28 +2469,27 @@ textarea::placeholder,input::placeholder{
     </div>
     <div style="display:flex;gap:.5rem;
       margin-bottom:1rem">
-      <input type="text" id="lk-query"
+      <input type="text" id="lk-query" aria-label="Домен, IP или автономная система" autocapitalize="none" spellcheck="false"
         placeholder="Сайт, IP, AS32934">
       <button class="btn btn-key"
         style="width:auto;padding:0 1.2rem"
-        onclick="doLookup()">
+        aria-label="Найти адреса" onclick="doLookup()">
         <span class="spinner-ring"
           id="lk-spin"></span>
-        <span class="btn-label">
-          &#128269;</span>
+        <span class="btn-label">Найти</span>
       </button>
     </div>
     <div id="lk-results"
       style="display:none">
       <div class="divider">
         <span>Результаты</span></div>
-      <div id="lk-info"
+      <div id="lk-info" role="status" aria-live="polite"
         style="font-size:.8rem;
         color:var(--muted);
         margin-bottom:.5rem"></div>
       <div id="lk-status"
         style="margin-bottom:.8rem"></div>
-      <textarea id="lk-output"
+      <textarea id="lk-output" aria-label="Результаты поиска"
         class="list-area" readonly
         style="min-height:200px;
         background:var(--bg)"></textarea>
@@ -2595,29 +2497,30 @@ textarea::placeholder,input::placeholder{
         gap:.5rem;margin-top:.5rem">
         <button class="btn btn-save"
           style="flex:1"
-          onclick="copyLookup(event)">
-          &#128203; Копировать</button>
+          id="copy-lookup" onclick="copyLookup(event)">
+           Копировать</button>
       </div>
+      <p class="hint" id="copy-note" role="status" aria-live="polite"></p>
       <p class="hint">
         Скопируйте и вставьте
         в список обхода нужного
         протокола.</p>
     </div>
   </div>
-</div>
-</div>
-<div class="dns-panel">
-  <button class="dns-toggle"
-    onclick="toggleDns()">
-    &#128268; DNS (DoT/DoH)</button>
-  <div class="dns-grid" id="dns-grid">
-    <div class="dns-label">Canonical DNS state</div>
-    <div class="dns-state unavailable" id="dns-state">DNS_UNAVAILABLE</div>
-    <div class="netfilter-status degraded" id="netfilter-state">Netfilter: NETFILTER_DEGRADED</div>
-    <div class="dns-label">Canonical DNS state legend</div>
+<div id="tab-dn" class="tab-content {% if active=='dn' %}active{% endif %}" role="tabpanel" aria-labelledby="btn-dn" tabindex="0"><div class="panel-heading"><div><h2>DNS и сеть</h2><p>Состояние DNSSEC, туннелей и правил перехвата</p></div></div><div class="info-box">Открытие вкладки читает сохранённое состояние. <b>«Проверить без изменений»</b> запускает измерения, <b>«Пересобрать DNS»</b> меняет конфигурацию после подтверждения.</div>
+  <div class="dns-grid open" id="dns-grid">
+    <div class="dns-label">Последнее решение DNS v4 (GET не запускает проверку)</div>
+    <div id="dns-refresh-note" role="status" aria-live="polite" class="hint"></div>
+    <div class="dns-state" id="dns-state">Ещё не прочитано</div>
+    <div id="dns-snapshot-age" class="hint"></div>
+    <div id="dns-client-state" class="hint">Порт 53: ещё не проверен</div>
+    <div class="netfilter-status" id="netfilter-state">Netfilter: ещё не проверен</div>
+    <button type="button" class="btn" onclick="fetchDns()">Проверить без изменений</button>
+    <button type="button" class="btn" onclick="applyDns()">Пересобрать DNS</button>
+    <div class="dns-label">Легенда последнего DNS-решения</div>
     <div class="dns-legend">
       <span class="dnssec">DNSSEC_OK</span>
-      <span class="no-dnssec">DNS_OK_NO_DNSSEC</span>
+      <span class="no-dnssec">EMERGENCY_DNS / без DNSSEC</span>
       <span class="tunnel">TUNNEL_DNS</span>
       <span class="unavailable">DNS_UNAVAILABLE</span>
     </div>
@@ -2637,11 +2540,9 @@ textarea::placeholder,input::placeholder{
     <div class="pin-box" id="pin-box"></div>
   </div>
 </div>
-<div class="dns-panel">
-  <button class="dns-toggle"
-    onclick="toggleVer()">
-    &#128230; Версии</button>
-  <div class="ver-grid" id="ver-grid">
+<div id="tab-up" class="tab-content {% if active=='up' %}active{% endif %}" role="tabpanel" aria-labelledby="btn-up" tabindex="0"><div class="panel-heading"><div><h2>Обновления</h2><p>Версии компонентов и управляемое обновление</p></div></div><div class="info-box">Проверка версий запускается вручную. Обновление может перезапустить сервисы и временно прервать соединения.</div><div class="panel-actions"><button type="button" class="btn btn-key" onclick="fetchVer()">Проверить версии</button></div>
+  <div class="ver-grid open" id="ver-grid">
+    <div id="versions-refresh-note" role="status" aria-live="polite" class="hint" style="grid-column:1/-1">Проверка ещё не запускалась. Нажмите «Проверить версии».</div>
     <div class="dns-label">
       Протокол &mdash; Версия</div>
     <div class="ver-item">
@@ -2701,6 +2602,9 @@ textarea::placeholder,input::placeholder{
     <div class="upd-out" id="upd-out"></div>
   </div>
 </div>
+</main>
+</div>
+<footer class="app-footer"><span>KeenZOO · UI 5</span><span>Настройки и ключи хранятся на роутере</span></footer>
 <script>
 /* Файл отдаётся роутером на каждый запрос страницы, поэтому русский
    текст пишется напрямую (страница в UTF-8), а не \uXXXX-кодами:
@@ -2713,21 +2617,16 @@ function each(a,f){for(var i=0;i<a.length;i++)f(a[i])}
    на каждый клик заново читать все списки обхода, считать записи и
    формировать 30 КБ HTML. Теперь запрос к роутеру не уходит вовсе,
    а адрес правится через history — ссылка остаётся рабочей. */
-function go(id){
-  var i,el,tabs=document.querySelectorAll('.tab-content'),
-  btns=document.querySelectorAll('.tab-btn');
-  for(i=0;i<tabs.length;i++)
-    tabs[i].classList.remove('active');
-  for(i=0;i<btns.length;i++)
-    btns[i].classList.remove('active');
-  el=g('tab-'+id);
-  if(!el){location.href='/?tab='+id;return}
-  el.classList.add('active');
-  el=g('btn-'+id);
-  if(el)el.classList.add('active');
-  if(window.history&&history.replaceState)
-    history.replaceState(null,'','/?tab='+id);
-  window.scrollTo(0,0)}
+function go(id,keepScroll){
+  var el=g('tab-'+id);if(!el)return;
+  each(document.querySelectorAll('.tab-content'),function(p){p.classList.toggle('active',p===el)});
+  each(document.querySelectorAll('.tab-btn'),function(b){var on=b.id==='btn-'+id;b.classList.toggle('active',on);b.setAttribute('aria-selected',on?'true':'false');b.tabIndex=on?0:-1});
+  if(window.history&&history.replaceState)history.replaceState(null,'','/?tab='+id);
+  document.title='KeenZOO — '+g('btn-'+id).querySelectorAll('span')[1].textContent;
+  if(window.matchMedia('(max-width:900px)').matches){var nav=document.querySelector('.tabs'),button=g('btn-'+id);nav.scrollLeft=button.offsetLeft-nav.clientWidth/2+button.offsetWidth/2;}
+  if(id==='dn')pollDns();
+  if(!keepScroll)window.scrollTo(0,0);
+}
 function jget(u,cb){fetch(u).then(function(r){
   return r.json()}).then(cb).catch(function(){})}
 /* Экранирование перед вставкой в innerHTML: значения приходят из
@@ -2810,14 +2709,15 @@ pollPin();
 setInterval(pollPin,60000);
 
 var DNS_PORTS={{ dns_ports|tojson }};
+(function(){var el=document.createElement('div');el.id='dns-v4-state';el.style.cssText='padding:8px;overflow-wrap:anywhere';var box=g('dns-grid');if(box)box.appendChild(el);})();
 var _dO=false;
 function toggleDns(){
   var el=g('dns-grid');_dO=!_dO;
   el.className=_dO?'dns-grid open':'dns-grid';
-  if(_dO)fetchDns()}
+  if(_dO)pollDns()}
 function dnsStateClass(state){
   return state==='DNSSEC_OK'?'dnssec':
-    (state==='DNS_OK_NO_DNSSEC'?'no-dnssec':
+    ((state==='DNS_OK_NO_DNSSEC'||state==='EMERGENCY_DNS')?'no-dnssec':
     (state==='TUNNEL_DNS'?'tunnel':'unavailable'))}
 function setDnsState(id,state){
   var el=g(id);if(!el)return;
@@ -2830,46 +2730,84 @@ function setNetfilterState(state){
     (state==='NETFILTER_OK'?'ok':'degraded');
   el.textContent='Netfilter: '+state;
 }
+function startCheck(url,done,fail){
+  var b=new FormData();b.append('csrf_token',
+    document.querySelector('input[name=csrf_token]').value);
+  fetch(url,{method:'POST',body:b,credentials:'same-origin'})
+  .then(function(r){return r.json().then(function(d){
+    if(!r.ok||!d.ok)throw new Error(d.error||'HTTP '+r.status);
+    done(d)})}).catch(fail)}
+var _dnsPolling=false, _dnsApplying=false;
 function fetchDns(){
-  setDnsState('dns-state','DNS_UNAVAILABLE');
-  setNetfilterState('NETFILTER_DEGRADED');
-  each(DNS_PORTS,function(p){
-    setCell(g('dp-'+p),'checking',p+'…')});
-  jget('/api/dns-status',function(d){
-    var dnsState=d.dns_state||'DNS_UNAVAILABLE';
+  if(_dnsPolling||_dnsApplying)return;
+  _dnsPolling=true;
+  g('dns-refresh-note').textContent='Проверка локальных DNS-портов без изменения настроек…';
+  each(DNS_PORTS,function(p){setCell(g('dp-'+p),'checking',p+'…')});
+  startCheck('/api/dns-probe',function(){pollDnsProbe();},function(e){
+    _dnsPolling=false;g('dns-refresh-note').textContent=String(e)})}
+function pollDnsProbe(){
+  fetch('/api/dns-probe',{credentials:'same-origin'})
+  .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})
+  .then(function(d){
+    if(d.status==='running'){setTimeout(pollDnsProbe,2000);return}
+    _dnsPolling=false;pollDns();
+  }).catch(function(e){_dnsPolling=false;g('dns-refresh-note').textContent='Ошибка: '+e})}
+function applyDns(){
+  if(_dnsPolling||_dnsApplying)return;
+  if(!confirm('Пересобрать DNS-конфигурацию? При изменении настроек dnsmasq будет перезапущен.'))return;
+  _dnsApplying=true;
+  g('dns-refresh-note').textContent='Применение DNS…';
+  startCheck('/api/dns-refresh',function(){pollDnsApply();},function(e){
+    _dnsApplying=false;g('dns-refresh-note').textContent=String(e)})}
+function pollDnsApply(){
+  fetch('/api/dns-refresh-status',{credentials:'same-origin'})
+  .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})
+  .then(function(d){
+    if(d.status==='running'){setTimeout(pollDnsApply,2000);return}
+    _dnsApplying=false;
+    if(d.status==='error'){
+      g('dns-refresh-note').textContent='Применение не завершено: '+(d.message||'');
+      return}
+    fetchDns();
+  }).catch(function(e){_dnsApplying=false;g('dns-refresh-note').textContent='Ошибка: '+e})}
+function pollDns(){
+  fetch('/api/dns-status',{credentials:'same-origin'})
+  .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})
+  .then(function(d){
+    var dnsState=d.dns_state||'DNS_UNAVAILABLE', snap=d.snapshot||{}, live=d.observation||{};
+    if(d.policy_v4&&d.policy_v4.version===4){var pv=d.policy_v4;var pn=g('dns-v4-state');if(pn)pn.textContent='Контроллер: '+pv.mode+' · Предпочтительный порт: '+(pv.preferred||'—')+' · Активный upstream: '+(pv.active?pv.active[0]+':'+pv.active[1]+' ('+(pv.active[2]?'TCP':'UDP')+')':'нет')+' · Туннель: '+(pv.tunnel||'не выбран')+(pv.health_mode==='hybrid'?' · Гибрид: контроль без подтверждений '+Math.round(pv.interval/60)+' мин; пул 11:00 / 23:00 (время роутера); возврат Primary '+Math.round(pv.recovery_interval/60)+' мин · Последнее подтверждение: '+(pv.last_evidence_epoch?new Date(pv.last_evidence_epoch*1000).toLocaleString():'нет')+' · Служебных проб: '+pv.health_query_count+' · Пассивных подтверждений: '+pv.passive_confirmations:'');}
     setDnsState('dns-state',dnsState);
+    g('dns-snapshot-age').textContent=snap.epoch
+      ? 'Решение от '+new Date(snap.epoch*1000).toLocaleString()+
+        '; возраст '+snap.age_seconds+' с. Это не текущая проверка.'
+      : 'Сохранённого решения нет';
     setNetfilterState(d.netfilter_state||'NETFILTER_DEGRADED');
-    each(['dot','doh'],function(t){
-      if(!d[t])return;
-      each(Object.keys(d[t]),function(p){
-        var info=d[t][p],
-            ok=typeof info==='boolean'?info:!!info.ok,
-            state=typeof info==='object'?(info.state||''):'',
-            cls=!ok?'unavailable':dnsStateClass(dnsState),
-            label=!ok?' \u2717 DNS':
-              (dnsState==='DNSSEC_OK'?' \u2713 DNSSEC':
-              (dnsState==='DNS_OK_NO_DNSSEC'?' \u2248 DNS':
-              (dnsState==='TUNNEL_DNS'?' \u2197 TUNNEL DNS':' \u2717 DNS')));
-        setCell(g('dp-'+p),cls,p+label);
-        if(g('dp-'+p)&&typeof info==='object')
-          g('dp-'+p).title=state+'; '+
-            (info.detail||'')})});
-    /* Пин показывается, только если адрес сервера задан доменом:
-       при заданном IP закреплять нечего и блок остаётся скрытым. */
-    var pb=g('pin-box'),pl=g('pin-label'),
-        pin=d.pinned||[];
+    var port53=(live.ports||{})['53'];
+    g('dns-client-state').textContent=port53
+      ? 'Порт 53: '+port53.state+(port53.rcode?' / '+port53.rcode:'')+
+        '; проверен '+new Date(port53.checked_at*1000).toLocaleTimeString()
+      : 'Порт 53: ещё не проверен';
+    g('dns-refresh-note').textContent=live.status==='error'
+      ? live.message : (live.checked_at
+        ? 'Измерения от '+new Date(live.checked_at*1000).toLocaleTimeString()+
+          (live.stale?' — устарели, повторите проверку':' (без изменения конфигурации)')
+        : 'Нет текущих измерений');
+    each(DNS_PORTS,function(p){
+      var info=(live.ports||{})[String(p)];
+      if(!info){setCell(g('dp-'+p),'checking',p+' — не измерен');return}
+      var cls=live.stale?'checking':(info.ok?(info.ad?'dnssec':'no-dnssec'):'unavailable');
+      var label=info.rcode||info.state;
+      setCell(g('dp-'+p),cls,p+' '+label+(live.stale?' (старое)':''));
+      if(g('dp-'+p))g('dp-'+p).title='IPv4 local query; '+info.state+'; '+info.elapsed_ms+' ms';
+    });
+    var pb=g('pin-box'),pl=g('pin-label'),pin=d.pinned||[];
     if(pb&&pl){
       if(pin.length){
-        var t='';
-        each(pin,function(x){
-          t+=esc(x.host)+' \u2192 '+esc(x.ip)+'\n'});
-        pb.textContent=t.replace(/\n$/,'');
-        pb.className='pin-box on';
-        pl.style.display='';
-      }else{
-        pb.className='pin-box';
-        pl.style.display='none';
-      }}})}
+        var t='';each(pin,function(x){t+=x.host+' → '+x.ip+'\n'});
+        pb.textContent=t.replace(/\n$/,'');pb.className='pin-box on';pl.style.display='';
+      }else{pb.className='pin-box';pl.style.display='none'}
+    }
+  }).catch(function(e){g('dns-refresh-note').textContent='Ошибка чтения состояния: '+e})}
 
 var VER_NAMES=['xray','hysteria','shadowsocks',
   'trojan','tor','dnsmasq'];
@@ -2939,20 +2877,35 @@ function runUpd(action,label){
 function toggleVer(){
   var el=g('ver-grid');_vO=!_vO;
   el.className=_vO?'ver-grid open':'ver-grid';
-  if(_vO)fetchVer()}
+  if(_vO)pollVer()}
+var _versionsPolling=false;
 function fetchVer(){
+  if(_versionsPolling)return;
+  _versionsPolling=true;
+  g('versions-refresh-note').textContent='Проверка версий…';
+  startCheck('/api/protocol-versions/refresh',function(){pollVer()},function(e){
+    _versionsPolling=false;g('versions-refresh-note').textContent=String(e)})}
+function pollVer(){
   each(VER_NAMES,function(n){
     setCell(g('ver-'+n),'checking',n+'…')});
-  jget('/api/protocol-versions',function(d){
+  fetch('/api/protocol-versions',{credentials:'same-origin'})
+  .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})
+  .then(function(d){
+    var job=d.check||{};
+    if(job.status==='running'){setTimeout(pollVer,2000);return}
+    _versionsPolling=false;
+    g('versions-refresh-note').textContent=job.status==='error' ? job.message :
+      (d.status==='partial' ? 'Не все источники доступны: '+(d.message||'DNS/WAN') :
+       (d.stale ? 'Данные устарели; повторите проверку' : 'Версии проверены'));
     if(!d.versions)return;
     var u={},src={},gh=d.github_only||{},any=false;
     if(d.updates)each(d.updates,function(x){
       u[x.name]=x.available;src[x.name]=x.source});
-    each(Object.keys(d.versions),function(n){
+    each(VER_NAMES,function(n){
       /* github_only — справочная версия для протоколов, которые
          обновляются только через opkg. Заполняется, лишь если на
          GitHub появилась сборка под архитектуру роутера. */
-      var v=d.versions[n],nv=u[n],
+      var v=d.versions[n]||'N/A',nv=u[n],
       /* Источник показывается рядом с версией: пользователь видит,
          откуда придёт обновление — с GitHub или из репозитория
          Entware. Для xray и hysteria выбирается более свежая. */
@@ -2968,12 +2921,14 @@ function fetchVer(){
           n+': '+v+' (GitHub: '+gh[n]+')');
         updBtnShow(n,false);
       }else{
-        setCell(g('ver-'+n),'ok',n+': '+v);
+        setCell(g('ver-'+n),v==='N/A'?'unavailable':'ok',n+': '+v);
         updBtnShow(n,false);
       }});
     /* «Обновить всё» имеет смысл лишь когда есть что обновлять. */
     var ar=g('upd-all-row');
-    if(ar)ar.className=any?'upd-all-row on':'upd-all-row'})}
+    if(ar)ar.className=any?'upd-all-row on':'upd-all-row'
+  }).catch(function(e){_versionsPolling=false;
+    g('versions-refresh-note').textContent='Ошибка: '+e})}
 
 function lkSet(v){g('lk-query').value=v;doLookup()}
 function doLookup(){
@@ -3046,21 +3001,114 @@ function doLookup(){
     alert('\u274C '+e)})}
 
 function copyLookup(ev){
-  var ta=g('lk-output');
-  ta.select();
-  ta.setSelectionRange(0,ta.value.length);
-  try{
-    document.execCommand('copy');
-    var b=(ev||window.event).target,
-    old=b.textContent;
-    b.textContent='\u2705 Скопировано';
-    setTimeout(function(){
-      b.textContent=old},2000)
-  }catch(e){}}
+  var ta=g('lk-output'),note=g('copy-note');
+  function result(ok){note.textContent=ok?'Скопировано в буфер обмена':'Не удалось скопировать автоматически. Выделите текст и скопируйте вручную.'}
+  function fallback(){ta.focus();ta.select();ta.setSelectionRange(0,ta.value.length);try{result(document.execCommand('copy'))}catch(e){result(false)}}
+  if(window.isSecureContext&&navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(ta.value).then(function(){result(true)},fallback)}else fallback();
+}
 
 g('lk-query').addEventListener('keypress',
   function(e){if(e.key==='Enter')doLookup()});
+
+/* UI 5: local-only appearance, keyboard navigation and unsaved input safety. */
+function syncThemeLabel(){var light=document.documentElement.dataset.theme==='light';g('theme-label').textContent=light?'Тёмная тема':'Светлая тема';g('theme-toggle').setAttribute('aria-label',light?'Включить тёмную тему':'Включить светлую тему');document.querySelector('meta[name="theme-color"]').content=light?'#f1f4f8':'#10151e'}
+function toggleTheme(){var theme=document.documentElement.dataset.theme==='light'?'dark':'light';document.documentElement.dataset.theme=theme;try{localStorage.setItem('keenzoo-theme',theme)}catch(e){}syncThemeLabel()}
+syncThemeLabel();
+var tabNav=document.querySelector('.tabs');
+function navOrientation(){tabNav.setAttribute('aria-orientation',window.matchMedia('(max-width:900px)').matches?'horizontal':'vertical')}
+navOrientation();window.addEventListener('resize',navOrientation);
+tabNav.addEventListener('keydown',function(e){
+  var btns=Array.prototype.slice.call(tabNav.querySelectorAll('[role=tab]')),i=btns.indexOf(document.activeElement);if(i<0)return;
+  var horizontal=tabNav.getAttribute('aria-orientation')==='horizontal',next=horizontal?'ArrowRight':'ArrowDown',prev=horizontal?'ArrowLeft':'ArrowUp';
+  if(e.key===next)i=(i+1)%btns.length;else if(e.key===prev)i=(i+btns.length-1)%btns.length;else if(e.key==='Home')i=0;else if(e.key==='End')i=btns.length-1;else return;
+  e.preventDefault();go(btns[i].id.slice(4),true);btns[i].focus();
+});
+var draftForms=[],leavingBySubmit=false;
+each(document.querySelectorAll('form'),function(form){
+  var fields=Array.prototype.slice.call(form.querySelectorAll('textarea:not([readonly]),input[type=text],select'));if(!fields.length)return;
+  var initial=fields.map(function(el){return el.value}),note=document.createElement('p');note.className='draft-indicator';note.setAttribute('role','status');note.textContent='Есть несохранённые изменения';form.appendChild(note);
+  function changed(){var dirty=fields.some(function(el,i){return el.value!==initial[i]});form.dataset.dirty=dirty?'1':'0';note.classList.toggle('visible',dirty)}
+  fields.forEach(function(el){el.addEventListener('input',changed);el.addEventListener('change',changed)});
+  draftForms.push(form);
+});
+window.addEventListener('beforeunload',function(e){if(!leavingBySubmit&&draftForms.some(function(f){return f.dataset.dirty==='1'})){e.preventDefault();e.returnValue=''}});
+each(document.querySelectorAll('form'),function(form){form.addEventListener('submit',function(e){
+  if(draftForms.some(function(f){return f!==form&&f.dataset.dirty==='1'})&&!confirm('В других формах есть несохранённые изменения. Продолжить и потерять их?')){e.preventDefault();e.stopImmediatePropagation();return}
+  leavingBySubmit=true;
+},true)});
+window.addEventListener('pageshow',function(){leavingBySubmit=false;each(document.querySelectorAll('.btn.loading'),function(b){b.classList.remove('loading');b.disabled=false})});
+// No active DNS checks or package lookups on initial page load or tab navigation.
+var initialTab=document.querySelector('.tab-btn.active');if(initialTab)go(initialTab.id.slice(4),true);
+
 </script></body></html>'''
+
+
+ROUTER_PROTOCOL_FILE = os.path.join(UNBLOCK_DIR, '.router_protocol')
+ROUTER_PROTOCOLS = {
+    'xray': ('vless', 'Xray / VLESS', 'localportvless'),
+    'trojan': ('trojan', 'Trojan', 'localporttrojan'),
+    'hysteria': ('hysteria', 'Hysteria2', 'localporthysteria'),
+}
+
+
+def get_router_protocol():
+    try:
+        with open(ROUTER_PROTOCOL_FILE, encoding='ascii') as f:
+            value = f.read(32).strip()
+    except FileNotFoundError:
+        return 'xray'
+    if value not in ROUTER_PROTOCOLS:
+        raise ValueError('Некорректный .router_protocol; выберите протокол заново')
+    return value
+
+
+def set_router_protocol(value: str) -> None:
+    if value not in ROUTER_PROTOCOLS:
+        raise ValueError('Допустимы только xray, trojan, hysteria')
+    service, _label, port_key = ROUTER_PROTOCOLS[value]
+    with shared_update_lock():
+        if os.path.exists(os.path.join(UNBLOCK_DIR, '.disabled')):
+            raise RuntimeError('Проект отключён; сначала выполните установку')
+        if not _read_enabled(service):
+            raise RuntimeError('Сначала включите выбранный протокол')
+        if not _proc_alive('xray' if value == 'xray' else value) or not _port_ready(
+                _config_port(port_key), udp=False):
+            raise RuntimeError('Выбранный протокол не слушает TCP-порт')
+        existed = os.path.exists(ROUTER_PROTOCOL_FILE)
+        old = read_file_text(ROUTER_PROTOCOL_FILE) if existed else ''
+        script = config.paths['redirect_script']
+        env = os.environ.copy()
+        env.update(type='iptable', table='nat', KEENZOO_UPDATE_LOCK_HELD='1',
+                   KEENZOO_LOCK_DIR=LOCK_DIR)
+        _atomic_write_text(ROUTER_PROTOCOL_FILE, value + '\n')
+        try:
+            _run_command(['/bin/sh', script], timeout=90, env=env,
+                         check=True, label='router TCP apply')
+        except Exception:
+            # Hook restores its iptables snapshot on error. Reconcile after
+            # restoring the setting too (also covers a terminated hook).
+            if existed:
+                _atomic_write_text(ROUTER_PROTOCOL_FILE, old + '\n')
+            else:
+                os.unlink(ROUTER_PROTOCOL_FILE)
+            rollback = _run_command(['/bin/sh', script], timeout=90, env=env,
+                                    label='router TCP rollback')
+            if rollback.returncode:
+                raise RuntimeError('Не удалось применить И откатить netfilter; проверьте журнал') from None
+            raise
+
+
+@app.route('/router/protocol', methods=['POST'])
+def route_router_protocol():
+    _check_csrf()
+    try:
+        set_router_protocol((request.form.get('protocol') or '').strip())
+    except ValueError as err:
+        return jsonify(ok=False, error=str(err)), 400
+    except (RuntimeError, OSError) as err:
+        return jsonify(ok=False, error=str(err)), 409
+    flash('TCP bot.txt: выбранный протокол применён. Новые соединения используют новый путь.', 'ok')
+    return redirect(url_for('index') + '?tab=bt')
 
 
 def _render(active='ss'):
@@ -3092,6 +3140,9 @@ def _render(active='ss'):
     ipsets['bt'] = BYPASS_IPSETS['bot']
     return render_template_string(
         PAGE_TEMPLATE,
+        router_protocol=(read_file_text(ROUTER_PROTOCOL_FILE).strip()
+                         if os.path.exists(ROUTER_PROTOCOL_FILE) else 'xray'),
+        router_protocols=ROUTER_PROTOCOLS,
         active=active,
         contents=contents,
         list_counts=lc,
@@ -3124,8 +3175,10 @@ def _read_proto_update():
 
 def _tail_file(path, limit=4000):
     try:
-        with open(path, 'r') as f:
-            return f.read()[-limit:]
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - limit))
+            return f.read(limit).decode('utf-8', 'replace')
     except Exception:
         return ''
 
@@ -3250,9 +3303,32 @@ def api_update_status():
     return jsonify(_read_update_status())
 
 
+@app.route('/api/dns-probe', methods=['GET', 'POST'])
+def api_dns_probe():
+    if request.method == 'POST':
+        _check_csrf()
+        if _lock_is_live(_GS.get('lock_dir', '/tmp/unblock_update.lockdir')):
+            return jsonify(ok=False, error='Выполняется применение DNS/списков'), 409
+        try:
+            started = _start_dns_probe()
+        except (OSError, RuntimeError):
+            return jsonify(ok=False, error='Не запущена DNS-проверка'), 500
+        return jsonify(ok=True, started=started), 202
+    data = _read_dns_observation()
+    data.pop('config_stamp', None)
+    return jsonify(data)
+
+
+@app.route('/api/dns-refresh-status')
+def api_dns_refresh_status():
+    return jsonify(_read_refresh_job(DNS_REFRESH_STATUS, DNS_REFRESH_LOCK))
+
+
 @app.route('/api/dns-status')
 def api_dns_status():
-    return jsonify(check_dns_ports())
+    data = check_dns_ports()
+    data['refresh'] = _read_refresh_job(DNS_REFRESH_STATUS, DNS_REFRESH_LOCK)
+    return jsonify(data)
 
 
 # Состояние доступности серверов обхода. Пишется unblock_dnsmasq.sh при
@@ -3276,55 +3352,111 @@ def api_pin_status():
         return jsonify({'kind': 'none', 'ts': 0, 'message': ''})
 
 
-def _start_updates_check_async(script):
-    if not _acquire_launcher_lock(UPDATES_CHECK_LOCK):
-        return False
-    cmd = (
-        shlex.quote(script)
-        + ' >/dev/null 2>&1; rc=$?; rm -rf '
-        + shlex.quote(UPDATES_CHECK_LOCK)
-        + '; exit "$rc"')
-    cmd = (
-        "printf '%s\\n' \"$$\" > "
-        + shlex.quote(UPDATES_CHECK_LOCK + '/pid')
-        + "; awk '{print $22}' \"/proc/$$/stat\" > "
-        + shlex.quote(UPDATES_CHECK_LOCK + '/start')
-        + ' 2>/dev/null || true; '
-        + cmd)
+# Background checks have bounded runtime and a visible terminal result. Their
+# shell children still own the normal update mutex; GET never starts work.
+DNS_REFRESH_LOCK = '/tmp/keenzoo_dns_refresh.lockdir'
+DNS_REFRESH_STATUS = '/tmp/keenzoo_dns_refresh.json'
+VERSIONS_REFRESH_STATUS = '/tmp/keenzoo_versions_refresh.json'
+
+
+def _read_refresh_job(path, lock):
     try:
-        subprocess.Popen(
-            ['/bin/sh', '-c', cmd],
-            start_new_session=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
-        return True
-    except Exception:
-        _release_launcher_lock(UPDATES_CHECK_LOCK)
+        with open(path, 'r') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError('invalid status')
+        if data.get('status') == 'running' and not _lock_is_live(lock):
+            data.update(status='error', message='Проверка прервана; запустите повторно')
+        return data
+    except (OSError, ValueError):
+        return {'status': 'idle', 'ts': 0, 'message': ''}
+
+
+def _start_refresh_job(script, lock, status_file, env=None, timeout=600):
+    if not os.path.isfile(script) or not os.access(script, os.X_OK):
+        raise FileNotFoundError(script)
+    if not _acquire_launcher_lock(lock):
         return False
+
+    def save(status, message='', rc=0):
+        _atomic_write_text(status_file, json.dumps({
+            'status': status, 'message': message, 'rc': rc,
+            'ts': int(time.time())}, ensure_ascii=False))
+
+    def worker():
+        try:
+            result = _run_command([script], timeout=timeout, env=env,
+                                  label='background check')
+            messages = {75: 'Другая операция заняла блокировку; повторите позже',
+                        124: 'Превышено время проверки; проверьте DNS и WAN'}
+            message = messages.get(result.returncode,
+                                   'Проверка завершилась ошибкой; см. журнал DNS/обновлений')
+            save('done' if result.returncode == 0 else 'error',
+                 '' if result.returncode == 0 else message, result.returncode)
+        except Exception:
+            logging.exception('background check failed')
+            try:
+                save('error', 'Ошибка фоновой проверки', 1)
+            except OSError:
+                pass
+        finally:
+            _release_launcher_lock(lock)
+
+    try:
+        save('running')
+        threading.Thread(target=worker, daemon=True, name='keenzoo-check').start()
+    except Exception:
+        _release_launcher_lock(lock)
+        raise
+    return True
+
+
+@app.route('/api/dns-refresh', methods=['POST'])
+def api_dns_refresh():
+    _check_csrf()
+    env = os.environ.copy()
+    env['DNS_HEALTH_ONLY'] = '1'
+    # Never inherit a parent's assertion that it owns the shell mutex.
+    env.pop('KEENZOO_UPDATE_LOCK_HELD', None)
+    try:
+        started = _start_refresh_job(
+            config.paths.get('unblock_dnsmasq', '/opt/bin/unblock_dnsmasq.sh'),
+            DNS_REFRESH_LOCK, DNS_REFRESH_STATUS, env=env)
+    except (OSError, RuntimeError):
+        return jsonify(ok=False, error='Не удалось запустить DNS-проверку'), 500
+    return jsonify(ok=True, started=started), 202
+
+
+@app.route('/api/protocol-versions/refresh', methods=['POST'])
+def api_versions_refresh():
+    _check_csrf()
+    try:
+        started = _start_updates_check_async(config.paths.get(
+            'check_updates', '/opt/bin/check_updates.sh'))
+    except (OSError, RuntimeError):
+        return jsonify(ok=False, error='Не удалось запустить проверку версий'), 500
+    return jsonify(ok=True, started=started), 202
+
+
+def _start_updates_check_async(script):
+    return _start_refresh_job(script, UPDATES_CHECK_LOCK,
+                              VERSIONS_REFRESH_STATUS, timeout=240)
 
 
 @app.route('/api/protocol-versions')
 def api_protocol_versions():
-    sf = config.paths.get(
-        'updates_status',
-        '/tmp/updates_status.json')
-    if not os.path.exists(sf):
-        cs = config.paths.get(
-            'check_updates',
-            '/opt/bin/check_updates.sh')
-        if os.path.exists(cs):
-            _start_updates_check_async(cs)
-    if os.path.exists(sf):
-        try:
-            with open(sf, 'r') as f:
-                return jsonify(
-                    json.load(f))
-        except Exception:
-            pass
-    return jsonify({
-        'ts': 0, 'has_updates': False,
-        'versions': {}, 'updates': []})
+    data = {'ts': 0, 'has_updates': False, 'versions': {}, 'updates': []}
+    try:
+        with open(config.paths.get('updates_status', '/tmp/updates_status.json')) as f:
+            cached = json.load(f)
+        if isinstance(cached, dict):
+            data.update(cached)
+        age = time.time() - float(data.get('ts', 0))
+        data['stale'] = not 0 <= age < 3600
+    except (OSError, ValueError, TypeError):
+        data['stale'] = True
+    data['check'] = _read_refresh_job(VERSIONS_REFRESH_STATUS, UPDATES_CHECK_LOCK)
+    return jsonify(data)
 
 
 @app.route('/api/lookup', methods=['POST'])
@@ -3344,7 +3476,7 @@ def index():
         'tab', 'ss')
     if active not in (
             'ss', 'tr', 'vl',
-            'to', 'hy', 'bt', 'lk'):
+            'to', 'hy', 'bt', 'lk', 'dn', 'up'):
         active = 'ss'
     return _render(active)
 

@@ -1,4 +1,893 @@
 # -*- coding: utf-8 -*-
+# --- KeenZOO DNS policy v4 (stdlib only; before optional bot imports) ---
+import datetime as _v4_datetime
+import ast as _v4_ast
+import concurrent.futures as _v4_futures
+import fcntl as _v4_fcntl
+import ipaddress as _v4_ip
+import json as _v4_json
+import os as _v4_os
+from pathlib import Path as _V4Path
+import re as _v4_re
+import secrets as _v4_secrets
+import signal as _v4_signal
+import socket as _v4_socket
+import socketserver as _v4_server
+import struct as _v4_struct
+import subprocess as _v4_subprocess
+import sys as _v4_sys
+import tempfile as _v4_temp
+import threading as _v4_thread
+import time as _v4_time
+
+V4_PORT = 40512  # Stable loopback facade; never included among candidate ports.
+V4_STATE = '/tmp/keenzoo-dns-v4.json'
+V4_LOCK = '/tmp/keenzoo-dns-v4.lock'
+V4_CONFIG = '/opt/etc/bot/bot_config.py'
+V4_PRIORITY = ('hysteria', 'xray', 'trojan')
+V4_MARKS = {'hysteria': 0x02000101, 'xray': 0x02000102, 'trojan': 0x02000103}
+V4_EMERGENCY_MARK = 0x02000104
+
+
+def v4_config(path=V4_CONFIG):
+    allowed = {'dnsovertls_ports', 'dnsoverhttps_ports', 'bootstrap_resolvers',
+               'dns_health_domain', 'dns_policy_interval', 'dns_policy_pool_hours',
+               'dns_policy_recovery_interval',
+               'localporthysteria', 'localportvless', 'localporttrojan'}
+    raw = {}
+    tree = _v4_ast.parse(_V4Path(path).read_text(encoding='utf-8'))
+    for node in tree.body:
+        if isinstance(node, _v4_ast.Assign):
+            for target in node.targets:
+                if isinstance(target, _v4_ast.Name) and target.id in allowed:
+                    raw[target.id] = _v4_ast.literal_eval(node.value)
+    ports = raw.get('dnsovertls_ports', [40500, 40501, 40502, 40503]) + raw.get('dnsoverhttps_ports', [40508, 40509, 40510, 40511])
+    if not ports or len(ports) > 16 or any(type(p) is not int or not 1024 <= p <= 65535 or p == V4_PORT for p in ports):
+        raise ValueError('invalid DNS candidate ports')
+    bootstrap = list(dict.fromkeys(str(_v4_ip.IPv4Address(p)) for p in raw.get('bootstrap_resolvers', ['9.9.9.9', '8.8.8.8', '1.1.1.1'])))
+    if not 1 <= len(bootstrap) <= 8 or any(not _v4_ip.IPv4Address(p).is_global for p in bootstrap):
+        raise ValueError('bootstrap_resolvers must contain 1..8 public IPv4 addresses')
+    domain = raw.get('dns_health_domain', 'example.com').rstrip('.')
+    if len(domain) > 253 or not all(_v4_re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', s) for s in domain.split('.')):
+        raise ValueError('invalid DNS health domain')
+    interval = raw.get('dns_policy_interval', 3600)
+    hours = raw.get('dns_policy_pool_hours', [11, 23])
+    recovery = raw.get('dns_policy_recovery_interval', 300)
+    if type(interval) is not int or not 1800 <= interval <= 3600:
+        raise ValueError('DNS idle control interval must be 1800..3600 seconds; migrate legacy settings')
+    if hours != [11, 23] or any(type(h) is not int for h in hours):
+        raise ValueError('DNS pool hours must be [11, 23] in router local time')
+    if type(recovery) is not int or recovery != 300:
+        raise ValueError('DNS Primary recovery interval must be 300 seconds')
+    targets = dict(zip(V4_PRIORITY, (raw.get('localporthysteria', 10830), raw.get('localportvless', 10810), raw.get('localporttrojan', 10829))))
+    if any(type(p) is not int or not 1024 <= p <= 65535 or p == V4_PORT for p in targets.values()):
+        raise ValueError('invalid tunnel listener port')
+    return {'ports': list(dict.fromkeys(ports)), 'bootstrap': bootstrap, 'domain': domain,
+            'interval': interval, 'pool_hours': hours, 'recovery_interval': recovery, 'targets': targets}
+
+
+def v4_name(data, offset):
+    labels, seen, end = [], set(), None
+    for _ in range(128):
+        if offset >= len(data) or offset in seen:
+            raise ValueError('invalid DNS name')
+        seen.add(offset)
+        n = data[offset]
+        if n & 0xc0 == 0xc0:
+            if offset + 1 >= len(data):
+                raise ValueError('short DNS pointer')
+            end = end if end is not None else offset + 2
+            offset = ((n & 63) << 8) | data[offset+1]
+        elif n == 0:
+            return b'.'.join(labels).lower(), end if end is not None else offset + 1
+        elif n <= 63 and offset + 1 + n <= len(data):
+            labels.append(data[offset+1:offset+1+n]); offset += n + 1
+        else:
+            raise ValueError('invalid DNS label')
+    raise ValueError('DNS name too complex')
+
+
+def v4_question(data):
+    if len(data) < 12 or _v4_struct.unpack('!H', data[4:6])[0] != 1:
+        raise ValueError('exactly one DNS question required')
+    name, offset = v4_name(data, 12)
+    if offset + 4 > len(data):
+        raise ValueError('short question')
+    return (name, data[offset:offset+4]), offset + 4
+
+
+def v4_query(domain):
+    name = b''.join(bytes([len(s)]) + s.encode('ascii') for s in domain.split('.')) + b'\0'
+    return _v4_struct.pack('!HHHHHH', _v4_secrets.randbits(16), 0x0120, 1, 0, 0, 1) + name + b'\0\x01\0\x01' + b'\0\0\x29\x04\xd0\0\0\x80\0\0\0'
+
+
+def v4_answer(data, query, health=False, secure=False):
+    if len(data) < 12 or data[:2] != query[:2]:
+        raise ValueError('DNS transaction mismatch')
+    flags = _v4_struct.unpack('!H', data[2:4])[0]
+    if not flags & 0x8000 or flags & 0x7800 or v4_question(data)[0] != v4_question(query)[0]:
+        raise ValueError('DNS response/question mismatch')
+    if health:
+        if flags & 0x020f or (secure and not flags & 0x0020):
+            raise ValueError('health response lacks validated positive result')
+        question, offset = v4_question(data)
+        if question[1] != b'\0\x01\0\x01':
+            raise ValueError('health requires an IN A question')
+        addresses, aliases = set(), {}
+        for _ in range(_v4_struct.unpack('!H', data[6:8])[0]):
+            owner, offset = v4_name(data, offset)
+            if offset + 10 > len(data):
+                raise ValueError('short resource record')
+            kind, cls, _, size = _v4_struct.unpack('!HHIH', data[offset:offset+10]); offset += 10
+            if offset + size > len(data):
+                raise ValueError('short resource data')
+            if kind == 1 and cls == 1 and size == 4:
+                addresses.add(owner)
+            elif kind == 5 and cls == 1:
+                alias, end = v4_name(data, offset)
+                if end != offset + size:
+                    raise ValueError('invalid CNAME data')
+                aliases[owner] = alias
+            offset += size
+        name = question[0]
+        for _ in range(32):
+            if name in addresses:
+                break
+            if name not in aliases:
+                raise ValueError('health response has no matching IPv4 answer')
+            name = aliases[name]
+        else:
+            raise ValueError('CNAME chain too complex')
+    return data
+
+
+def v4_recv(sock, count, deadline=None):
+    chunks = bytearray()
+    deadline = deadline or (_v4_time.monotonic() + (sock.gettimeout() or 2))
+    while len(chunks) < count:
+        remaining = deadline - _v4_time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("DNS frame deadline")
+        sock.settimeout(remaining)
+        data = sock.recv(count - len(chunks))
+        if not data:
+            raise OSError('short DNS TCP frame')
+        chunks.extend(data)
+    return bytes(chunks)
+
+
+def v4_exchange(query, host, port, tcp=False, mark=0, timeout=2):
+    # Every exchange uses a fresh socket. Mark is set BEFORE connect; a failed
+    # SO_MARK never falls back to unmarked/direct DNS.
+    with _v4_socket.socket(_v4_socket.AF_INET, _v4_socket.SOCK_STREAM if tcp else _v4_socket.SOCK_DGRAM) as sock:
+        deadline = _v4_time.monotonic() + timeout
+        sock.settimeout(timeout)
+        if mark:
+            sock.setsockopt(_v4_socket.SOL_SOCKET, getattr(_v4_socket, 'SO_MARK', 36), mark)
+        sock.connect((host, port))
+        if tcp:
+            remaining = deadline - _v4_time.monotonic()
+            if remaining <= 0: raise TimeoutError("DNS connect deadline")
+            sock.settimeout(remaining)
+            sock.sendall(_v4_struct.pack('!H', len(query)) + query)
+            size = _v4_struct.unpack('!H', v4_recv(sock, 2, deadline))[0]
+            data = v4_recv(sock, size, deadline)
+        else:
+            sock.send(query); data = sock.recv(65535)
+    v4_answer(data, query)
+    if not tcp and data[2] & 2:
+        return v4_exchange(query, host, port, True, mark, timeout)
+    return data
+
+
+def v4_fail(query):
+    try:
+        end = v4_question(query)[1]
+        return query[:2] + _v4_struct.pack('!HHHHH', 0x8082 | (query[2] & 1) << 8, 1, 0, 0, 0) + query[12:end]
+    except (ValueError, IndexError):
+        return b''
+
+
+def v4_identity(pid):
+    text = _V4Path('/proc/%d/stat' % pid).read_text()
+    fields = text[text.rfind(')')+2:].split()
+    if fields[0] == 'Z': raise ValueError('worker is a zombie')
+    return fields[19]
+
+
+def v4_read_state(path):
+    fd = _v4_os.open(path, _v4_os.O_RDONLY | _v4_os.O_NOFOLLOW)
+    with _v4_os.fdopen(fd) as stream:
+        stat = _v4_os.fstat(stream.fileno())
+        if stat.st_uid != _v4_os.geteuid() or stat.st_mode & 0o022:
+            raise ValueError('unsafe DNS state ownership')
+        return _v4_json.loads(stream.read(65536))
+
+
+def v4_status(path=V4_STATE, check_age=True):
+    try:
+        result = v4_read_state(path)
+        if result.get('version') != 4 or v4_identity(int(result['pid'])) != result['start']:
+            return {}
+        age = _v4_time.time() - result['epoch']
+        limit = 180 if result.get('health_mode') == 'hybrid' else max(180, int(result.get('interval', 15))*3 + 120)
+        if check_age and (age < -2 or age > limit):
+            return {}
+        return result
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return {}
+
+
+class DNSPolicyV4:
+    # The maintenance tick reads local files and publishes a heartbeat ONLY.
+    # It is NOT a DNS probe, subprocess, cron job or connection to the WAN.
+    HEARTBEAT = 30
+    EVENT_COOLDOWN = 30
+
+    def __init__(self, cfg, state_path=V4_STATE, exchange=v4_exchange):
+        self.cfg, self.state_path, self.exchange = cfg, state_path, exchange
+        self.stop = _v4_thread.Event()
+        self.wake = _v4_thread.Event()
+        self.rerank = _v4_thread.Event()
+        self.network_event = _v4_thread.Event()
+        self.guard = _v4_thread.RLock()
+        self.active = None
+        self.mode = 'DNS_UNAVAILABLE'
+        self.preferred = None
+        self.metrics = {}
+        self.last_pool = 0
+        self.last_restart = {}
+        self.deploy_owner = self.deployment_owner()
+        self.last_log = None
+        self.query_count = 0
+        self.health_query_count = 0
+        self.passive_confirmations = 0
+        self.failure_events = 0
+        self.generation = 0
+        self.last_checked = 0
+        self.last_good = 0
+        self.last_evidence_epoch = None
+        self.last_control_epoch = None
+        self.last_primary_probe = 0
+        self.last_primary_probe_epoch = None
+        self.last_heartbeat = _v4_time.monotonic()
+        self.last_maintenance = None
+        self.pending_failure = False
+        self.pending_network = False
+        self.pending_rerank = False
+        self.next_event = 0
+        self.initialized = False
+        self.check_reason = 'starting'
+        self.next_pool_epoch = self.next_pool_time(_v4_time.time())
+        self.last_calendar_slot = ''
+        self.last_wall = _v4_time.time()
+        self.config_stamp = None
+        self.listener_stamp = None
+        try:
+            old = v4_read_state(state_path)
+            if old.get('candidates') == cfg['ports'] and old.get('preferred') in cfg['ports']:
+                self.preferred = old['preferred']
+        except (OSError, ValueError):
+            pass
+
+    def next_pool_time(self, now):
+        local = _v4_datetime.datetime.fromtimestamp(now)
+        for day in (0, 1, 2):
+            date = local.date() + _v4_datetime.timedelta(days=day)
+            for hour in self.cfg.get('pool_hours', [11, 23]):
+                slot = _v4_datetime.datetime.combine(date, _v4_datetime.time(hour))
+                # timestamp() uses the same local TZ/DST rules as the router.
+                if slot.timestamp() > now:
+                    return slot.timestamp()
+        raise ValueError('cannot schedule DNS pool')
+
+    def health(self, target, secure=False, samples=1):
+        rtts = []
+        for _ in range(samples):
+            if self.stop.is_set():
+                return None
+            query = v4_query(self.cfg['domain'])
+            started = _v4_time.monotonic()
+            with self.guard:
+                self.health_query_count += 1
+            try:
+                response = self.exchange(query, *target)
+                v4_answer(response, query, health=True, secure=secure)
+                rtts.append((_v4_time.monotonic() - started) * 1000)
+            except (OSError, ValueError):
+                return None
+        return sum(rtts) / len(rtts)
+
+    def scan_local(self, ports):
+        if not ports:
+            return
+        def one(port):
+            target = ('127.0.0.1', port, False, 0)
+            result = self.health(target, True)
+            if result is None:  # Confirm an error; steady healthy port costs ONE query.
+                result = self.health(target, True)
+            return port, result
+        with _v4_futures.ThreadPoolExecutor(max_workers=3) as pool:
+            for port, rtt in pool.map(one, ports):
+                with self.guard:
+                    self.metrics[port] = {'rtt': rtt, 'at': _v4_time.time()}
+                    if port == self.preferred:
+                        self.last_primary_probe = _v4_time.monotonic()
+                        self.last_primary_probe_epoch = _v4_time.time()
+
+    @staticmethod
+    def deployment_owner():
+        try:
+            root = _V4Path('/tmp/keenzoo_deploy.lockdir')
+            return ((root/'pid').read_text().strip(), (root/'start').read_text().strip())
+        except OSError:
+            return None
+
+    @staticmethod
+    def listener_identity(protocol, port):
+        inodes = set()
+        try:
+            for name in ('tcp', 'tcp6'):
+                with open('/proc/net/' + name) as table:
+                    for row in table:
+                        columns = row.split()
+                        if len(columns) > 9 and columns[3] == '0A' and int(columns[1].split(':')[-1], 16) == int(port):
+                            inodes.add('socket:[' + columns[9] + ']')
+            if not inodes:
+                return False, False
+            for directory in _V4Path('/proc').glob('[0-9]*'):
+                try:
+                    argv0 = (directory/'cmdline').read_bytes().split(b'\0', 1)[0].decode('utf-8', 'replace')
+                    if _v4_os.path.basename(argv0) != protocol:
+                        continue
+                    for fd in (directory/'fd').iterdir():
+                        try:
+                            if _v4_os.readlink(fd) in inodes:
+                                return True, True
+                        except OSError:
+                            pass
+                except OSError:
+                    continue
+        except (OSError, ValueError):
+            return True, False  # Unverifiable is not permission to start/probe.
+        return True, False
+
+    def tunnel_ready(self, protocol):
+        # Fail-closed proof of the exact marked path. filter blocks tcp/53
+        # if NAT redirection disappears; it is not PID/listener verification.
+        mark = hex(V4_MARKS[protocol])
+        port = str(self.cfg['targets'][protocol])
+        rules = [
+            ['-t', 'nat', '-C', 'OUTPUT', '-j', 'KZ_DNS_V4'],
+            ['-t', 'nat', '-C', 'KZ_DNS_V4', '-p', 'tcp', '--dport', '53', '-m', 'mark', '--mark', mark, '-j', 'REDIRECT', '--to-ports', port],
+            ['-t', 'filter', '-C', 'OUTPUT', '-p', 'tcp', '--dport', '53', '-m', 'mark', '--mark', mark, '-j', 'REJECT'],
+        ]
+        try:
+            if not all(_v4_subprocess.run(['iptables', '-w', '2'] + r, stdout=_v4_subprocess.DEVNULL, stderr=_v4_subprocess.DEVNULL, timeout=4).returncode == 0 for r in rules):
+                return False
+        except (OSError, _v4_subprocess.TimeoutExpired):
+            return False
+        listening, owned = self.listener_identity(protocol, int(port))
+        if listening:
+            return owned
+        if _V4Path('/tmp/keenzoo_protocol_update.lockdir').exists():
+            return False
+        if _V4Path('/tmp/keenzoo_installing').exists():
+            owner = self.deployment_owner()
+            # A new worker is started by deploy only AFTER code/config copy.
+            # An old worker must not revive a daemon while binaries are replaced.
+            if owner is None or owner != self.deploy_owner:
+                return False
+        now = _v4_time.monotonic()
+        if now - self.last_restart.get(protocol, -1000) < 90:
+            return False
+        self.last_restart[protocol] = now
+        init = {'hysteria': 'S57hysteria', 'xray': 'S24xray', 'trojan': 'S22trojan'}[protocol]
+        path = '/opt/etc/init.d/' + init
+        try:
+            if _v4_re.search(r'^\s*ENABLED\s*=\s*no\b', _V4Path(path).read_text(), _v4_re.M):
+                return False
+            _v4_subprocess.run([path, 'start'], stdin=_v4_subprocess.DEVNULL, stdout=_v4_subprocess.DEVNULL, stderr=_v4_subprocess.DEVNULL, timeout=8)
+            return self.listener_identity(protocol, int(port))[1]  # Then health() must verify the actual DNS exchange.
+        except (OSError, _v4_subprocess.TimeoutExpired):
+            return False
+
+    def choose(self, full=False, reason='control'):
+        """One requested round, NOT a periodic polling loop.
+
+        Only candidates verified in THIS round may be promoted. Saved pool
+        metrics are diagnostic, never permission to use a 12-hour-old backup.
+        """
+        self.check_reason = reason
+        active = self.active
+        secure_active = bool(active and active[0] == '127.0.0.1')
+        recovery = reason == 'primary-recovery' and active is not None
+        if full or not self.initialized or (recovery and self.preferred is None):
+            ports = list(self.cfg['ports'])
+        elif recovery:
+            ports = [self.preferred] if self.preferred in self.cfg['ports'] else []
+        else:
+            ports = [active[1]] if secure_active else []
+        tested = set(ports)
+        self.scan_local(ports)
+        self.initialized = True
+        if recovery:
+            self.last_primary_probe = _v4_time.monotonic()
+            self.last_primary_probe_epoch = _v4_time.time()
+        # In event/control mode first confirm the active resolver. The failed
+        # preferred resolver has its own five-minute timer, not every event.
+        active_ok = secure_active and active[1] in tested and self.metrics[active[1]]['rtt'] is not None
+        if not recovery and not active_ok and len(tested) < len(self.cfg['ports']):
+            remaining = [p for p in self.cfg['ports'] if p not in tested]
+            self.scan_local(remaining)
+            tested.update(remaining)
+        if len(tested) == len(self.cfg['ports']):
+            self.last_pool = _v4_time.time()
+            if self.preferred is None:
+                self.last_primary_probe = _v4_time.monotonic()
+                self.last_primary_probe_epoch = self.last_pool
+        with self.guard:
+            eligible = sorted((self.metrics[p]['rtt'], p) for p in tested if self.metrics[p]['rtt'] is not None)
+        # Keep a working Primary sticky. Keep an already working local backup
+        # until Primary recovers, rather than moving between backups for RTT.
+        # An explicit rerank is the single exception: it re-evaluates the pure
+        # fastest candidate and drops both active and backup stickiness.
+        order = [p for _, p in eligible]
+        if reason != 'rerank':
+            # Insert preferred FIRST so the working active backup wins when
+            # both are eligible: the recovery probe/rerank owns the return to
+            # Primary; an event/pool scan must not cause a second switch.
+            for port in (self.preferred, active[1] if secure_active else None):
+                if port in order:
+                    order.remove(port); order.insert(0, port)
+        for port in order:
+            target = ('127.0.0.1', port, False, 0)
+            if target != active:
+                # First positive was scan_local(); a second is required before
+                # entering a different state/target, including initial startup.
+                if self.health(target, True) is None:
+                    with self.guard:
+                        self.metrics[port] = {'rtt': None, 'at': _v4_time.time()}
+                    continue
+            if self.preferred is None or self.preferred not in self.cfg['ports']:
+                self.preferred = port
+            if port == self.preferred:
+                self.last_primary_probe = _v4_time.monotonic()
+                self.last_primary_probe_epoch = _v4_time.time()
+            self.commit('LOCAL_DNSSEC', target)
+            return
+        if recovery:
+            # Do NOT ping the working backup or all tunnels every five minutes.
+            self.publish()
+            return
+        for protocol in V4_PRIORITY:
+            if self.stop.is_set():
+                return
+            if not self.tunnel_ready(protocol):
+                continue
+            for host in self.cfg['bootstrap']:
+                target = (host, 53, True, V4_MARKS[protocol])
+                if self.target_ready(target, active):
+                    self.commit('TUNNEL_DNS', target)
+                    return
+        for host in self.cfg['bootstrap']:
+            for tcp in (False, True):
+                target = (host, 53, tcp, V4_EMERGENCY_MARK)
+                if self.target_ready(target, active):
+                    self.commit('EMERGENCY_DNS', target)
+                    return
+        self.commit('DNS_UNAVAILABLE', None)
+
+    def target_ready(self, target, active):
+        result = self.health(target)
+        if result is None:
+            result = self.health(target)
+        return result is not None and (target == active or self.health(target) is not None)
+
+    def commit(self, mode, target):
+        with self.guard:
+            if target != self.active or mode != self.mode:
+                self.generation += 1
+                self.last_good = 0
+                self.last_evidence_epoch = None
+                self.pending_failure = False
+            self.mode, self.active = mode, target
+            self.last_checked = self.last_heartbeat = _v4_time.monotonic()
+            self.last_control_epoch = _v4_time.time()
+            if target:
+                self.last_good = self.last_checked
+                self.last_evidence_epoch = self.last_control_epoch
+            else:
+                self.last_primary_probe = self.last_checked
+            self.next_event = max(self.next_event, self.last_checked +
+                                  (self.EVENT_COOLDOWN if target else self.cfg.get('recovery_interval', 300)))
+        self.publish()
+
+    def publish(self):
+        with self.guard:
+            target, mode = self.active, self.mode
+            protocol = next((p for p, mark in V4_MARKS.items() if target and target[3] == mark), None)
+            state = {'version': 4, 'pid': _v4_os.getpid(), 'start': v4_identity(_v4_os.getpid()),
+                     'epoch': int(_v4_time.time()), 'mode': mode, 'active': list(target) if target else None,
+                     'preferred': self.preferred, 'tunnel': protocol, 'listen_port': V4_PORT,
+                     'candidates': self.cfg['ports'], 'metrics': self.metrics, 'query_count': self.query_count,
+                     'health_mode': 'hybrid', 'interval': self.cfg['interval'],
+                     'pool_hours': self.cfg.get('pool_hours', [11, 23]),
+                     'recovery_interval': self.cfg.get('recovery_interval', 300),
+                     'next_pool_epoch': int(self.next_pool_epoch), 'last_pool_epoch': self.last_pool,
+                     'last_evidence_epoch': self.last_evidence_epoch,
+                     'last_control_epoch': self.last_control_epoch,
+                     'last_primary_probe_epoch': self.last_primary_probe_epoch,
+                     'health_query_count': self.health_query_count,
+                     'passive_confirmations': self.passive_confirmations,
+                     'failure_events': self.failure_events, 'check_reason': self.check_reason}
+        path = _V4Path(self.state_path)
+        fd, filename = _v4_temp.mkstemp(prefix=path.name+'.', dir=str(path.parent))
+        try:
+            with _v4_os.fdopen(fd, 'w') as stream:
+                stream.write(_v4_json.dumps(state, separators=(',', ':')))
+            _v4_os.replace(filename, path)
+        finally:
+            if _v4_os.path.exists(filename): _v4_os.unlink(filename)
+        key = (mode, target, self.preferred)
+        # Bound the same inode held by stdout, even during repeated flaps.
+        if self.state_path == V4_STATE:
+            logfile = _V4Path('/opt/var/log/unblock_dns_v4.log')
+            try:
+                if logfile.stat().st_size > 65536:
+                    with logfile.open('rb') as stream:
+                        stream.seek(-32768, 2); tail = stream.read()
+                    logfile.write_bytes(tail)
+            except OSError:
+                pass
+        if key != self.last_log:
+            self.last_log = key
+            # stdout goes to a bounded service log (only transitions, no names).
+            print('DNSv4 mode=%s preferred=%s active=%s tunnel=%s' % (mode, self.preferred, target, protocol), flush=True)
+
+    def request_check(self, network=False, rerank=False):
+        with self.guard:
+            was_pending = self.pending_network or self.pending_failure or self.pending_rerank
+            if network:
+                self.pending_network = True
+            elif not rerank:
+                self.pending_failure = True
+            if rerank:
+                self.pending_rerank = True
+            if not was_pending:
+                self.wake.set()
+
+    def observe(self, query, response, target, generation, rtt):
+        """No DNS I/O here. Only the exact current upstream may refresh proof.
+
+        A positive, matching IN A answer with AD and CD=0 is suitable passive
+        evidence. Unsigned domains, NXDOMAIN, CD=1 and non-A replies are NOT
+        DNSSEC failures, and cannot indefinitely postpone the control timer.
+        """
+        flags = _v4_struct.unpack('!H', response[2:4])[0]
+        qflags = _v4_struct.unpack('!H', query[2:4])[0]
+        positive = False
+        try:
+            v4_answer(response, query, health=True, secure=self.mode == 'LOCAL_DNSSEC')
+            positive = not bool(qflags & 0x0010)
+        except ValueError:
+            pass
+        with self.guard:
+            if self.active != target or self.generation != generation:
+                return
+            secure = self.mode == 'LOCAL_DNSSEC'
+            if positive:
+                self.last_good = _v4_time.monotonic()
+                self.last_evidence_epoch = _v4_time.time()
+                self.passive_confirmations += 1
+                if secure:
+                    self.metrics[target[1]] = {'rtt': rtt, 'at': self.last_evidence_epoch}
+            # AD absence is meaningful only for the configured signed control
+            # name with an explicit AD request and CD=0; never for arbitrary
+            # unsigned names. A probe confirms every failure before switching.
+            known_signed = (v4_question(query)[0] ==
+                            (self.cfg.get('domain', 'example.com').encode('ascii').lower(), b'\0\x01\0\x01'))
+            lost_ad = secure and known_signed and qflags & 0x0020 and not qflags & 0x0010 and not flags & 0x0020
+            if flags & 15 in (2, 5) or lost_ad:
+                self.failure_events += 1
+                self.request_check()
+
+    def forward(self, query, tcp=False):
+        # Invalid client packets must not trigger health probes (DoS amplifier).
+        try:
+            v4_question(query)
+            if query[2] & 0xf8:
+                raise ValueError('invalid query opcode')
+        except (ValueError, IndexError):
+            return v4_fail(query)
+        with self.guard:
+            target, generation = self.active, self.generation
+            fresh = _v4_time.monotonic() - self.last_heartbeat <= 180
+            self.query_count += 1
+        if not target or not fresh:
+            self.request_check()
+            return v4_fail(query)
+        try:
+            started = _v4_time.monotonic()
+            response = self.exchange(query, *target)
+            v4_answer(response, query)
+            self.observe(query, response, target, generation, (_v4_time.monotonic()-started)*1000)
+            return response
+        except (OSError, ValueError, IndexError):
+            with self.guard:
+                if self.active == target and self.generation == generation:
+                    self.failure_events += 1
+                    self.request_check()
+            return v4_fail(query)
+
+    def listener_fingerprint(self):
+        # Socket inode changes expose stubby/DoH restarts without querying DNS
+        # or spawning pidof/netstat. Only local IPv4 listener ports are used.
+        result = []
+        ports = set(self.cfg['ports']) | set(self.cfg.get('targets', {}).values())
+        for kind in ('tcp', 'udp'):
+            try:
+                for row in _V4Path('/proc/net/' + kind).read_text().splitlines()[1:]:
+                    cols = row.split()
+                    host, port = cols[1].split(':')
+                    if host in ('0100007F', '00000000') and int(port, 16) in ports and cols[3] in ('0A', '07'):
+                        result.append((kind, port, cols[9]))
+            except (OSError, ValueError, IndexError):
+                return None  # A failed proc read is not evidence of a restart.
+        return tuple(sorted(result))
+
+    def maintenance(self):
+        if _V4Path('/opt/etc/unblock/.disabled').exists():
+            self.stop.set(); return
+        try:
+            stat = _V4Path(V4_CONFIG).stat()
+        except OSError:
+            # A transiently unreadable config keeps the last validated values;
+            # it must not mark a working resolver unavailable every tick.
+            stat = None
+        stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size) if stat is not None else self.config_stamp
+        if stamp is not None and stamp != self.config_stamp:
+            updated = v4_config()
+            if updated != self.cfg:
+                with self.guard:
+                    self.cfg = updated
+                    self.metrics = {}
+                    self.next_pool_epoch = self.next_pool_time(_v4_time.time())
+                self.request_check(network=True)
+            self.config_stamp = stamp
+        listeners = self.listener_fingerprint()
+        if listeners is not None:
+            if self.listener_stamp is not None and listeners != self.listener_stamp:
+                self.request_check(network=True)
+            self.listener_stamp = listeners
+
+    def tick(self):
+        """Deterministic scheduling step. Heartbeats never call choose()."""
+        now, wall = _v4_time.monotonic(), _v4_time.time()
+        self.last_heartbeat = now
+        if wall < self.last_wall - 120:
+            self.next_pool_epoch = self.next_pool_time(wall)
+        self.last_wall = wall
+        if self.network_event.is_set():
+            self.network_event.clear(); self.request_check(network=True)
+        if self.rerank.is_set():
+            self.rerank.clear(); self.request_check(rerank=True)
+        reason, full = None, False
+        if not self.initialized:
+            reason, full = 'startup', True
+        elif wall >= self.next_pool_epoch:
+            # A forward clock jump coalesces missed slots to ONE scan. A clock
+            # rollback must not scan the same local calendar slot twice.
+            slot = _v4_datetime.datetime.fromtimestamp(self.next_pool_epoch).strftime('%Y-%m-%d %H')
+            self.next_pool_epoch = self.next_pool_time(wall)
+            if slot > self.last_calendar_slot:
+                self.last_calendar_slot = slot
+                reason, full = 'scheduled-pool', True
+        with self.guard:
+            if reason is None and now >= self.next_event and (self.pending_network or self.pending_failure or self.pending_rerank):
+                full = self.pending_network or self.pending_rerank
+                reason = 'rerank' if self.pending_rerank else ('network-event' if full else 'client-error')
+                if self.pending_rerank:
+                    self.preferred = None
+                self.pending_network = self.pending_failure = self.pending_rerank = False
+                self.next_event = now + self.EVENT_COOLDOWN
+            active_primary = self.active == ('127.0.0.1', self.preferred, False, 0)
+            recovery_due = not active_primary and now - self.last_primary_probe >= self.cfg.get('recovery_interval', 300)
+            if reason is None and recovery_due:
+                reason = 'primary-recovery'
+                full = self.active is None
+            if reason is None and self.active and now - max(self.last_good, self.last_checked) >= self.cfg['interval']:
+                reason = 'idle-control'
+        if reason:
+            if full:
+                with self.guard:
+                    if self.pending_rerank:
+                        self.preferred = None
+                    self.pending_network = self.pending_failure = self.pending_rerank = False
+            self.choose(full=full, reason=reason)
+        # Bound status age independently of the hour-long health interval.
+        # publish() does local atomic file replacement, no DNS requests.
+        self.publish()
+        now = _v4_time.monotonic()
+        waits = [self.HEARTBEAT, max(.05, self.next_pool_epoch - _v4_time.time())]
+        with self.guard:
+            if self.pending_network or self.pending_failure or self.pending_rerank:
+                waits.append(max(.05, self.next_event - now))
+            if self.active != ('127.0.0.1', self.preferred, False, 0):
+                waits.append(max(.05, self.last_primary_probe + self.cfg.get('recovery_interval', 300) - now))
+            if self.active:
+                waits.append(max(.05, max(self.last_good, self.last_checked) + self.cfg['interval'] - now))
+        return min(waits)
+
+    def monitor(self):
+        while not self.stop.is_set():
+            self.wake.clear()
+            try:
+                now = _v4_time.monotonic()
+                if self.last_maintenance is None or now-self.last_maintenance >= self.HEARTBEAT:
+                    self.maintenance()
+                    self.last_maintenance = now
+                if self.stop.is_set():
+                    break
+                delay = self.tick()
+            except Exception as exc:
+                self.commit('DNS_UNAVAILABLE', None)
+                print('DNSv4 monitor error=%s' % type(exc).__name__, flush=True)
+                delay = self.HEARTBEAT
+            self.wake.wait(delay)
+
+
+class _V4Bounded(_v4_server.ThreadingMixIn):
+    daemon_threads = True
+    allow_reuse_address = True
+    def process_request(self, request, address):
+        if not self.slots.acquire(False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except Exception:
+            self.slots.release(); raise
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.slots.release()
+    def handle_error(self, request, address):
+        pass
+
+
+class V4UDP(_V4Bounded, _v4_server.UDPServer):
+    max_packet_size = 65535
+
+
+class V4TCP(_V4Bounded, _v4_server.TCPServer):
+    request_queue_size = 32
+
+
+class V4UDPHandler(_v4_server.BaseRequestHandler):
+    def handle(self):
+        data, sock = self.request
+        result = self.server.policy.forward(data)
+        if result:
+            sock.sendto(result, self.client_address)
+
+
+class V4TCPHandler(_v4_server.BaseRequestHandler):
+    def handle(self):
+        self.request.settimeout(4)
+        size = _v4_struct.unpack('!H', v4_recv(self.request, 2))[0]
+        data = v4_recv(self.request, size)
+        result = self.server.policy.forward(data, True)
+        if result:
+            self.request.sendall(_v4_struct.pack('!H', len(result)) + result)
+
+
+def v4_shell(state):
+    mode = state.get('mode', 'DNS_UNAVAILABLE')
+    if mode not in ('LOCAL_DNSSEC', 'TUNNEL_DNS', 'EMERGENCY_DNS'):
+        mode = 'DNS_UNAVAILABLE'
+    tunnel = state.get('tunnel') if mode == 'TUNNEL_DNS' else ''
+    if mode == 'TUNNEL_DNS' and tunnel not in V4_PRIORITY:
+        mode, tunnel = 'DNS_UNAVAILABLE', ''
+    port = str(V4_PORT)  # Keep dnsmasq attached during outage/recovery.
+    fields = {'DNS_MODE': mode, 'DNS_PRIMARY_LEVEL': 'DNSSEC_OK' if mode == 'LOCAL_DNSSEC' else mode,
+              'DNS_PRIMARY': port, 'DNS_WORKING_PORTS': port, 'DNS_BACKUP_PORTS': '', 'DNS_PRIMARY_RTT_MS': '',
+              'DNS_SECURE_PORTS': port if mode == 'LOCAL_DNSSEC' else '',
+              'DNS_INSECURE_PORTS': port if mode in ('TUNNEL_DNS', 'EMERGENCY_DNS') else '',
+              'DNS_TUNNEL_REQUIRED': int(mode == 'TUNNEL_DNS'), 'DNS_TUNNEL_READY': int(mode == 'TUNNEL_DNS'),
+              'DNS_TUNNEL_PROTOCOL': tunnel or '', 'DNS_RANKING': ''}
+    return '\n'.join("%s='%s'" % (k, v) for k, v in fields.items())
+
+
+def v4_main(command):
+    _v4_os.umask(0o077)
+    if command == '--dns-status':
+        print(_v4_json.dumps(v4_status(), indent=2)); return 0
+    if command == '--dns-shell':
+        print(v4_shell(v4_status())); return 0
+    if command in ('--dns-rerank', '--dns-event'):
+        state = v4_status()
+        if not state: return 1
+        _v4_os.kill(state['pid'], _v4_signal.SIGUSR1 if command == '--dns-rerank' else _v4_signal.SIGUSR2)
+        return 0
+    if command == '--dns-stop':
+        state = v4_status(check_age=False)
+        if state:
+            _v4_os.kill(state['pid'], _v4_signal.SIGTERM)
+            for _ in range(50):
+                if not v4_status(check_age=False):
+                    return 0
+                _v4_time.sleep(.1)
+            return 1
+        return 0
+    if _V4Path('/opt/etc/unblock/.disabled').exists():
+        return 1
+    if command == '--dns-start':
+        if v4_status():
+            return 0
+        if v4_status(check_age=False) and v4_main('--dns-stop') != 0:
+            return 1
+        # Validate config before spawning; no imports/credentials executed.
+        v4_config()
+        log = _V4Path('/opt/var/log/unblock_dns_v4.log')
+        log.parent.mkdir(parents=True, exist_ok=True)
+        if log.exists() and log.stat().st_size > 65536:
+            with log.open('rb') as stream:
+                stream.seek(-32768, 2); tail = stream.read()
+            log.write_bytes(tail)
+        with log.open('ab') as out:
+            _v4_subprocess.Popen([_v4_sys.executable, '-u', __file__, '--dns-run'], start_new_session=True,
+                                stdin=_v4_subprocess.DEVNULL, stdout=out, stderr=out,
+                                env={k: v for k, v in _v4_os.environ.items() if k not in ('KEENZOO_UPDATE_LOCK_HELD', 'KEENZOO_LOCK_DIR', 'KEENZOO_DNS_STAGE', 'DNS_HEALTH_LOG')})
+        for _ in range(50):
+            if v4_status():
+                return 0
+            _v4_time.sleep(.1)
+        return 1
+    if command != '--dns-run':
+        return 2
+    lock_fd = _v4_os.open(V4_LOCK, _v4_os.O_CREAT | _v4_os.O_RDWR | _v4_os.O_NOFOLLOW, 0o600)
+    with _v4_os.fdopen(lock_fd, 'a') as lock:
+        if _v4_os.fstat(lock.fileno()).st_uid != _v4_os.geteuid():
+            raise ValueError('unsafe DNS lock ownership')
+        try:
+            _v4_fcntl.flock(lock, _v4_fcntl.LOCK_EX | _v4_fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        policy = DNSPolicyV4(v4_config())
+        slots = _v4_thread.BoundedSemaphore(24)
+        with V4UDP(('127.0.0.1', V4_PORT), V4UDPHandler) as udp, V4TCP(('127.0.0.1', V4_PORT), V4TCPHandler) as tcp:
+            for server in (udp, tcp):
+                server.policy, server.slots = policy, slots
+                _v4_thread.Thread(target=server.serve_forever, daemon=True).start()
+            for sig in (_v4_signal.SIGTERM, _v4_signal.SIGINT):
+                _v4_signal.signal(sig, lambda *_: (policy.stop.set(), policy.wake.set()))
+            _v4_signal.signal(_v4_signal.SIGUSR1, lambda *_: (policy.rerank.set(), policy.wake.set()))
+            _v4_signal.signal(_v4_signal.SIGUSR2, lambda *_: (policy.network_event.set(), policy.wake.set()))
+            policy.publish()
+            worker = _v4_thread.Thread(target=policy.monitor, daemon=True)
+            worker.start()
+            while not policy.stop.wait(1):
+                if not worker.is_alive():
+                    raise RuntimeError("DNS monitor stopped")
+            for server in (udp, tcp):
+                server.shutdown()
+        try:
+            _V4Path(V4_STATE).unlink()
+        except FileNotFoundError:
+            pass
+        return 0
+
+
+if __name__ == '__main__' and len(_v4_sys.argv) == 2 and _v4_sys.argv[1].startswith('--dns-'):
+    try:
+        raise SystemExit(v4_main(_v4_sys.argv[1]))
+    except Exception as _v4_error:
+        print('DNSv4 error: %s' % type(_v4_error).__name__, file=_v4_sys.stderr)
+        raise SystemExit(1)
+# --- end KeenZOO DNS policy v4 ---
+
 import os
 import signal
 import time
@@ -15,6 +904,7 @@ import html
 from urllib.parse import (
     urlparse, parse_qs, unquote)
 import base64
+from collections import deque
 import bot_config as config
 
 
@@ -54,9 +944,9 @@ def clean_log(log_file, max_size=None, keep_lines=None):
         if os.path.getsize(log_file) > max_size:
             with open(log_file, 'r', encoding='utf-8',
                       errors='replace') as f:
-                lines = f.readlines()
+                lines = deque(f, maxlen=keep_lines)
             with open(log_file, 'w', encoding='utf-8') as f:
-                f.writelines(lines[-keep_lines:])
+                f.writelines(lines)
     except OSError:
         pass
 
@@ -241,7 +1131,7 @@ def _preflight_hysteria(tmp_path):
 
 
 def _preflight_trojan(tmp_path):
-    """Структурная проверка конфига trojan (бинарник не имеет режима теста)."""
+    """Структурная проверка Trojan; init дополнительно выполняет trojan -t."""
     try:
         with open(tmp_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -638,7 +1528,7 @@ def parse_vless_key(key, bot=None,
             or not parsed_url.username):
         raise ValueError("Нет адреса/ID")
     _reject_ipv6_host(parsed_url.hostname)
-    port = parsed_url.port or 443
+    port = 443 if parsed_url.port is None else parsed_url.port
     if not (1 <= port <= 65535):
         raise ValueError(f"Порт: {port}")
     transport = params.get(
