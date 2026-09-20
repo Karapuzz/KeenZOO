@@ -1,0 +1,14 @@
+{
+  "server": [
+    "{{server}}"
+  ],
+  "mode": "tcp_and_udp",
+  "server_port": 140,
+  "password": "{{password}}",
+  "timeout": 86400,
+  "method": "chacha20-ietf-poly1305",
+  "local_address": "0.0.0.0",
+  "local_port": 1082,
+  "fast_open": false,
+  "ipv6_first": false
+}
