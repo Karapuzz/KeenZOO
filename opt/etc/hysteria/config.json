@@ -1,0 +1,25 @@
+{
+  "server": "{{server}}",
+  "auth": "{{auth}}",
+  "tls": {
+    "sni": "{{sni}}",
+    "insecure": false,
+    "alpn": [
+      "h3"
+    ]
+  },
+  "quic": {
+    "initStreamReceiveWindow": 8388608,
+    "maxStreamReceiveWindow": 8388608,
+    "initConnReceiveWindow": 20971520,
+    "maxConnReceiveWindow": 20971520,
+    "congestion": "bbr"
+  },
+  "tcpRedirect": {
+    "listen": "0.0.0.0:10830"
+  },
+  "udpTProxy": {
+    "listen": "0.0.0.0:10830",
+    "timeout": "60s"
+  }
+}
