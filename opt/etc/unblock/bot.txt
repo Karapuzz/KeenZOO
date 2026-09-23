@@ -18,5 +18,4 @@ updates.tdesktop.com
 
 # Telegram CDN
 t.me
-telegram.me2ip.ru
-2ip.io
+telegram.me
