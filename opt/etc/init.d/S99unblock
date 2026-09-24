@@ -1,0 +1,31 @@
+#!/bin/sh
+# Existing entrypoint now owns the v4 resolver service lifecycle.
+set -eu
+PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+export PATH
+case "${1:-}" in
+    stop|dns-stop) python3 /opt/etc/bot/utils.py --dns-stop; exit $? ;;
+esac
+[ ! -f /opt/etc/unblock/.disabled ] || exit 0
+# Cron/init must not race an installer copying code. Deploy starts utils directly.
+[ ! -f /tmp/keenzoo_installing ] || exit 0
+case "${1:-}" in
+    dns-start) exec python3 /opt/etc/bot/utils.py --dns-start ;;
+    dns-event)
+        # Event notification, not a periodic process/probe launcher.
+        python3 /opt/etc/bot/utils.py --dns-event && exit 0
+        exec python3 /opt/etc/bot/utils.py --dns-start
+        ;;
+    dns-status|status) exec python3 /opt/etc/bot/utils.py --dns-status ;;
+    dns-restart)
+        python3 /opt/etc/bot/utils.py --dns-stop
+        exec python3 /opt/etc/bot/utils.py --dns-start
+        ;;
+    start|restart)
+        if [ "$1" = restart ]; then python3 /opt/etc/bot/utils.py --dns-stop; fi
+        python3 /opt/etc/bot/utils.py --dns-start
+        [ -x /opt/bin/unblock_update.sh ] || exit 0
+        (trap '' HUP; exec /opt/bin/unblock_update.sh) >/dev/null 2>&1 </dev/null &
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|dns-start|dns-restart|dns-event|dns-status}" >&2; exit 2 ;;
+esac
