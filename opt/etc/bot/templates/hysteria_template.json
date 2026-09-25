@@ -1,0 +1,31 @@
+{
+  "server": "{{server}}:{{port}}",
+  "auth": "{{auth}}",
+  "lazy": true,
+  "tls": {
+    "sni": "{{sni}}",
+    "insecure": {{insecure}},
+    "alpn": [{{alpn}}]
+  },
+  "obfs": {
+    "type": "{{obfs_type}}",
+    "salamander": {
+      "password": "{{obfs_password}}"
+    }
+  },
+  "quic": {
+    "initStreamReceiveWindow": 524288,
+    "maxStreamReceiveWindow": 1048576,
+    "initConnReceiveWindow": 1048576,
+    "maxConnReceiveWindow": 4194304,
+    "keepAlivePeriod": "10s",
+    "maxIdleTimeout": "30s"
+  },
+  "tcpRedirect": {
+    "listen": "0.0.0.0:{{localporthysteria}}"
+  },
+  "udpTProxy": {
+    "listen": "0.0.0.0:{{localporthysteria}}",
+    "timeout": "60s"
+  }
+}
