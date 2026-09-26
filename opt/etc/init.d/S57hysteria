@@ -1,0 +1,246 @@
+#!/bin/sh
+# remove leaves init files for backup; block future starts, not stop/status.
+if [ -f /opt/etc/unblock/.disabled ]; then
+    case "${1:-start}" in start|restart|reconfigure|reload) exit 0 ;; esac
+fi
+# /opt/etc/init.d/S57hysteria
+# Hysteria 2 transparent client for Keenetic/Entware BusyBox.
+# The service is deliberately started here, after S56dnsmasq. Unlike the
+# stock rc.func wrapper this keeps bounded stderr diagnostics and confirms the
+# real TCP/UDP listener, not merely a short-lived PID.
+
+ENABLED=yes
+PROCS=hysteria
+DESC=$PROCS
+PATH=/opt/sbin:/opt/bin:/opt/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONFIG=/opt/etc/hysteria/config.json
+LOGFILE=/opt/var/log/hysteria.log
+
+HYSTERIA_BIN="$(command -v hysteria 2>/dev/null || true)"
+[ -n "$HYSTERIA_BIN" ] || exit 0
+
+key_config_ready() {
+    # A complete JSON can be a stale preserved config. Only a config written
+    # through the key/config panel receives this explicit readiness marker.
+    [ -f "/opt/etc/unblock/.configured/hysteria" ] || return 1
+    [ -s "$CONFIG" ] || return 1
+    grep -q '{{' "$CONFIG" 2>/dev/null && return 1
+    grep -qE '"(address|server|remote_addr|password|auth|id|publicKey)"[[:space:]]*:[[:space:]]*(""|\[[[:space:]]*""|\[\])' "$CONFIG" 2>/dev/null && return 1
+    return 0
+}
+
+# The generated config contains both tcpRedirect and udpTProxy listeners.
+# Read the first configured listen port instead of hard-coding the current
+# port, so a user's bot_config.py remains authoritative.
+hysteria_port() {
+    _hp="$(sed -n \
+        's/.*"listen"[[:space:]]*:[[:space:]]*"[^:]*:\([0-9][0-9]*\)".*/\1/p' \
+        "$CONFIG" 2>/dev/null | head -1)"
+    case "$_hp" in ''|*[!0-9]*) _hp=10830 ;; esac
+    printf '%s\n' "$_hp"
+}
+
+hysteria_listener_ready() {
+    # dns4.2.36 (аудит, KZ-02): готовность = ОБА слушателя (проектный
+    # конфиг всегда поднимает и tcpRedirect, и udpTProxy), а сокеты
+    # принадлежат процессу проекта. Прежде хватало ИЛИ-проверки:
+    # отсутствие одной из сторон транспорта считалось готовностью, а
+    # чужой сокет на порту мог её имитировать.
+    _hlr_port="$(hysteria_port)"
+    _hlr_hex="$(printf '%04X' "$_hlr_port")"
+    awk -v p=":$_hlr_hex" \
+        'NR > 1 && index($2,p) == length($2)-length(p)+1 && $4 == "0A" {ok=1}
+         END {exit !ok}' /proc/net/tcp /proc/net/tcp6 2>/dev/null || return 1
+    awk -v p=":$_hlr_hex" \
+        'NR > 1 && index($2,p) == length($2)-length(p)+1 {ok=1}
+         END {exit !ok}' /proc/net/udp /proc/net/udp6 2>/dev/null || return 1
+    # Принадлежность: инороды сокетов на порту должны быть среди
+    # дескрипторов процесса(ов) проекта.
+    _hlr_pids="$(_project_hysteria_pids)"
+    [ -n "$_hlr_pids" ] || return 1
+    _hlr_inodes=""
+    for _hlr_pid in $_hlr_pids; do
+        _hlr_inodes="$_hlr_inodes $(ls -l "/proc/$_hlr_pid/fd" 2>/dev/null \
+            | sed -n 's/^.*socket:\[\([0-9][0-9]*\)\].*$/\1/p')"
+    done
+    [ -n "${_hlr_inodes# }" ] || return 1
+    for _hlr_f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+        [ -r "$_hlr_f" ] || continue
+        if awk -v p=":$_hlr_hex" -v il="$_hlr_inodes" '
+            NR > 1 && index($2,p) == length($2)-length(p)+1 {
+                n = split(il, arr, " ")
+                for (i = 1; i <= n; i++) if ($10 == arr[i]) { found=1; exit }
+            } END { exit !found }' "$_hlr_f" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+rotate_hysteria_log() {
+    mkdir -p /opt/var/log 2>/dev/null || true
+    : >> "$LOGFILE" 2>/dev/null || true
+    _hl_size="$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)"
+    _hl_lines="$(wc -l < "$LOGFILE" 2>/dev/null || echo 0)"
+    case "$_hl_size:$_hl_lines" in
+        *[!0-9:]* ) return 0 ;;
+    esac
+    if [ "$_hl_size" -gt 65536 ] || [ "$_hl_lines" -gt 200 ]; then
+        _hl_tmp="${LOGFILE}.tmp.$$"
+        tail -n 160 "$LOGFILE" > "$_hl_tmp" 2>/dev/null \
+            && cat "$_hl_tmp" > "$LOGFILE" 2>/dev/null || true
+        rm -f "$_hl_tmp"
+    fi
+}
+
+log_hysteria_failure() {
+    _lhf_reason="$1"
+    _lhf_tail="$(tail -12 "$LOGFILE" 2>/dev/null | tr '\n' ' ' \
+        | sed 's/[[:space:]][[:space:]]*/ /g')"
+    logger -t S57hysteria \
+        "start failed: $_lhf_reason${_lhf_tail:+; stderr=$_lhf_tail}" \
+        2>/dev/null || true
+    echo "hysteria: $_lhf_reason" >&2
+    [ -n "$_lhf_tail" ] && echo "  stderr: $_lhf_tail" >&2
+}
+
+# dns4.2.27 (внешний аудит, S-01; класс дефекта A3 H4): точечный стоп
+# ПРОЕКТНОЙ hysteria через /proc и путь конфига в cmdline. Прежние
+# `killall $PROCS`/`pidof $PROCS` задевали бы любой вручную запущенный
+# пользователем процесс с тем же именем.
+_project_hysteria_pids() {
+    for _php_dir in /proc/[0-9]*; do
+        [ -r "$_php_dir/cmdline" ] || continue
+        _php_argv0="$(tr '\000' '\n' < "$_php_dir/cmdline" 2>/dev/null | head -1 || true)"
+        [ "$(basename "$_php_argv0" 2>/dev/null)" = "$PROCS" ] || continue
+        _php_cmd="$(tr '\000' ' ' < "$_php_dir/cmdline" 2>/dev/null || true)"
+        case "$_php_cmd" in
+            */opt/etc/hysteria/*) printf '%s\n' "${_php_dir#/proc/}" ;;
+        esac
+    done
+}
+
+_signal_project_hysteria() {
+    _sph_sig="${1:-TERM}"
+    for _sph_pid in $(_project_hysteria_pids); do
+        kill "-$_sph_sig" "$_sph_pid" 2>/dev/null || true
+    done
+}
+
+stop_hysteria() {
+    printf 'Shutting down %s... ' "$DESC"
+    _signal_project_hysteria TERM
+    _hs=0
+    while [ -n "$(_project_hysteria_pids)" ] && [ "$_hs" -lt 10 ]; do
+        sleep 1
+        _hs=$((_hs + 1))
+    done
+    if [ -n "$(_project_hysteria_pids)" ]; then
+        _signal_project_hysteria KILL
+    fi
+    if [ -n "$(_project_hysteria_pids)" ]; then
+        echo 'failed.'
+        return 1
+    fi
+    echo 'done.'
+    return 0
+}
+
+start_hysteria() {
+    rotate_hysteria_log
+    if [ -n "$(_project_hysteria_pids)" ]; then
+        if hysteria_listener_ready; then
+            echo "already running."
+            return 0
+        fi
+        # A PID without a listener is a failed old PROJECT instance. Do
+        # not let it make DNS/netfilter believe that the Hysteria client
+        # is usable. Чужой (пользовательский) процесс здесь не трогается.
+        _signal_project_hysteria TERM
+        sleep 1
+    fi
+
+    printf 'Starting %s... ' "$DESC"
+    (
+        trap '' HUP
+        exec "$HYSTERIA_BIN" client -c "$CONFIG" --log-level error
+    ) >>"$LOGFILE" 2>&1 &
+    _hpid="$!"
+    _hw=0
+    while [ "$_hw" -lt 12 ]; do
+        if ! kill -0 "$_hpid" 2>/dev/null; then
+            wait "$_hpid" 2>/dev/null || true
+            echo 'failed.'
+            log_hysteria_failure 'process exited before listener'
+            return 1
+        fi
+        if hysteria_listener_ready; then
+            echo 'done.'
+            logger -t S57hysteria "started: listener port=$(hysteria_port)" \
+                2>/dev/null || true
+            return 0
+        fi
+        sleep 1
+        _hw=$((_hw + 1))
+    done
+
+    echo 'failed.'
+    log_hysteria_failure "listener $(hysteria_port) not ready"
+    kill "$_hpid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$_hpid" 2>/dev/null || true
+    return 1
+}
+
+case "${1:-start}" in
+    start|restart)
+        if [ "$ENABLED" != yes ]; then
+            [ "${1:-start}" = restart ] && stop_hysteria >/dev/null 2>&1 || true
+            echo "hysteria disabled — service is not started" >&2
+            exit 0
+        fi
+        if ! key_config_ready; then
+            [ "${1:-start}" = restart ] && stop_hysteria >/dev/null 2>&1 || true
+            echo "ключ не задан — сервис не запускается; добавьте ключ через бота или веб-панель" >&2
+            exit 0
+        fi
+        ;;
+    stop|kill|check|status|reconfigure) ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|check|status|kill|reconfigure}" >&2
+        exit 1
+        ;;
+esac
+
+case "${1:-start}" in
+    start)
+        start_hysteria
+        ;;
+    restart)
+        stop_hysteria >/dev/null 2>&1 || true
+        # dns4.2.36 (аудит, KZ-02): если прежний экземпляр не умер,
+        # новый не запускается — иначе гонка двух процессов за порт.
+        if [ -n "$(_project_hysteria_pids)" ]; then
+            echo "$DESC: предыдущий экземпляр не остановлен — перезапуск отменён" >&2
+            exit 1
+        fi
+        start_hysteria
+        ;;
+    stop)
+        stop_hysteria
+        ;;
+    kill)
+        _signal_project_hysteria KILL
+        ;;
+    check|status)
+        if [ -n "$(_project_hysteria_pids)" ] && hysteria_listener_ready; then
+            echo "$DESC is running (process + listener ready)"
+            exit 0
+        fi
+        echo "$DESC is not ready"
+        exit 1
+        ;;
+    reconfigure)
+        _signal_project_hysteria HUP
+        ;;
+esac
