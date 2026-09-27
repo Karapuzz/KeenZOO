@@ -1,0 +1,45 @@
+#!/bin/sh
+# remove leaves init files for backup; block future starts, not stop/status.
+if [ -f /opt/etc/unblock/.disabled ]; then
+    case "${1:-start}" in start|restart|reconfigure|reload) exit 0 ;; esac
+fi
+
+ENABLED=yes
+PROCS=ss-redir
+ARGS="-c /opt/etc/shadowsocks.json -u"
+PREARGS=""
+DESC=$PROCS
+PATH=/opt/sbin:/opt/bin:/opt/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CONFIG=/opt/etc/shadowsocks.json
+
+# dns4.2.37 L-5: отсутствие бинаря глушило ЛЮБУЮ команду, включая
+# stop/status: деплой считал сервис остановленным, хотя процесс мог
+# жить (бинарь удалён при обновлении пакета). Гасим только попытки
+# запуска; stop и статус доходят до сервис-менеджера.
+case "${1:-start}" in
+    start|restart|reconfigure|reload) [ -n "$(which $PROCS)" ] || exit 0 ;;
+esac
+
+key_config_ready() {
+    # dns4.2.20: симметрия с S22trojan/S24xray/S57hysteria — полный JSON
+    # может быть старым сохранённым конфигом; явный старт разрешён только
+    # для конфига, записанного через бота/панель (маркер пишет
+    # _mark_tunnel_configured; без него эта строка блокировала бы старт
+    # навсегда — правки mapping и guard атомарны).
+    [ -f "/opt/etc/unblock/.configured/shadowsocks" ] || return 1
+    [ -s "$CONFIG" ] || return 1
+    grep -q '{{' "$CONFIG" 2>/dev/null && return 1
+    grep -qE '"(address|server|remote_addr|password|auth|id|publicKey)"[[:space:]]*:[[:space:]]*(""|\[[[:space:]]*""|\[\])' "$CONFIG" 2>/dev/null && return 1
+    return 0
+}
+case "${1:-start}" in
+    start|restart)
+        if ! key_config_ready; then
+            [ "${1:-start}" = restart ] && "$0" stop >/dev/null 2>&1 || true
+            echo "ключ не задан — сервис не запускается; добавьте ключ через бота или веб-панель" >&2
+            exit 0
+        fi
+        ;;
+esac
+
+. /opt/etc/init.d/rc.func
