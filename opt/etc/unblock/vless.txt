@@ -1,7 +1,0 @@
-#Тест протокола
-2ip.io
-2ip.ru
-
-#Торренты
-nnmclub.to
-nnmstatic.win
